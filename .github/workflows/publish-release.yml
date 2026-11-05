@@ -138,13 +138,12 @@ jobs:
           tag="v${RELEASE_VERSION}"
 
           if gh release view "$tag" >/dev/null 2>&1; then
-            echo "::error::Release $tag already exists. Refusing to overwrite it."
-            exit 1
+            gh release upload "$tag" "$RELEASE_FILE" --clobber
+            echo "Updated existing $tag asset with $RELEASE_FILE."
+          else
+            gh release create "$tag" "$RELEASE_FILE" \
+              --target "$GITHUB_SHA" \
+              --title "BTD Macro ${RELEASE_VERSION}" \
+              --notes "BTD Macro ${RELEASE_VERSION} release."
+            echo "Published $tag with asset $RELEASE_FILE."
           fi
-
-          gh release create "$tag" "$RELEASE_FILE" \
-            --target "$GITHUB_SHA" \
-            --title "BTD Macro ${RELEASE_VERSION}" \
-            --notes "BTD Macro ${RELEASE_VERSION} release."
-
-          echo "Published $tag with asset $RELEASE_FILE."
