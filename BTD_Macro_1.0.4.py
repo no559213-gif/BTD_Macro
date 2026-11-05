@@ -1369,6 +1369,9 @@ finally:
             self.original_host_style = win32gui.GetWindowLong(
                 parent_hwnd, win32con.GWL_STYLE
             )
+            # Save the target HWND before changing any styles so every later
+            # exception goes through the same full rollback path.
+            self.docked_hwnd = hwnd
             win32gui.SetWindowLong(
                 parent_hwnd,
                 win32con.GWL_STYLE,
@@ -1380,7 +1383,6 @@ finally:
                 | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE
                 | win32con.SWP_FRAMECHANGED
             )
-            self.docked_hwnd = hwnd
 
             self._arranging_windows = True
             self._cancel_roblox_mouse_mode(hwnd)
@@ -1580,7 +1582,8 @@ finally:
             from ctypes import wintypes
 
             user32 = ctypes.WinDLL("user32", use_last_error=True)
-            get_current_thread_id = user32.GetCurrentThreadId
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            get_current_thread_id = kernel32.GetCurrentThreadId
             get_current_thread_id.restype = wintypes.DWORD
             get_window_thread_id = user32.GetWindowThreadProcessId
             get_window_thread_id.argtypes = [
