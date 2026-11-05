@@ -1,9 +1,8 @@
-"""BTD Macro 1.0.2 - GUI scaffold.
+"""BTD Macro 1.0.3.
 
-This file builds the requested dark, four-tab interface. The macro and recording
-engines are intentionally placeholders; no game inputs are automated yet.
-
-Roblox docking is implemented on Windows when pywin32 is installed.
+Dark four-tab GUI with a GitHub release updater and a Windows Roblox child-window
+host. The macro and recording engines remain GUI placeholders; no gameplay
+automation is sent by this version.
 """
 
 from __future__ import annotations
@@ -1163,8 +1162,6 @@ finally:
             return None
         matches: list[int] = []
         own_hwnd = self.root.winfo_id()
-        own_pid = os.getpid()
-
         def callback(hwnd: int, _extra) -> bool:
             try:
                 if hwnd == own_hwnd or not win32gui.IsWindowVisible(hwnd):
@@ -1293,7 +1290,7 @@ finally:
                 raise RuntimeError("Windows did not attach the Roblox window to the game panel.")
 
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            self._resize_embedded_roblox()
+            self._resize_embedded_roblox(force=True)
             win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
             self.game_placeholder.place_forget()
             self.dock_button.configure(
@@ -1341,10 +1338,10 @@ finally:
         except tk.TclError:
             pass
 
-    def _resize_embedded_roblox(self) -> None:
+    def _resize_embedded_roblox(self, *, force: bool = False) -> None:
         if (
             self.docked_hwnd is None or not PYWIN32_AVAILABLE
-            or self._arranging_windows
+            or (self._arranging_windows and not force)
         ):
             return
         try:
@@ -1364,6 +1361,7 @@ finally:
             self.append_log(f"WARNING resizing embedded Roblox window: {exc}")
 
     def _handle_lost_roblox_window(self) -> None:
+        self._restore_clip_cursor(self._original_clip_rect)
         self.docked_hwnd = None
         self.original_window_state = None
         self._original_clip_rect = None
@@ -1457,9 +1455,10 @@ finally:
             | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE
             | win32con.SWP_FRAMECHANGED
         )
-        win32gui.ShowWindow(
-            hwnd, win32con.SW_SHOW if state.get("visible", True) else win32con.SW_HIDE
-        )
+        if not state.get("visible", True):
+            win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+        elif placement is None:
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
         if restore_clip:
             self._restore_clip_cursor(self._original_clip_rect)
 
