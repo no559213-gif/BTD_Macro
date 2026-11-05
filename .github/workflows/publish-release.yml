@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Identify release or publishing test
         id: plan
@@ -65,6 +67,32 @@ jobs:
           version="${version%.py}"
 
           python -m py_compile "$file"
+          python - "$file" "$version" <<'PY'
+          import ast
+          import pathlib
+          import sys
+
+          source_path = pathlib.Path(sys.argv[1])
+          version = sys.argv[2]
+          tree = ast.parse(source_path.read_text(encoding="utf-8"))
+
+          app_title = None
+          for node in tree.body:
+              if isinstance(node, ast.Assign):
+                  if any(isinstance(target, ast.Name) and target.id == "APP_TITLE" for target in node.targets):
+                      app_title = ast.literal_eval(node.value)
+                      break
+              elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "APP_TITLE":
+                  app_title = ast.literal_eval(node.value)
+                  break
+
+          expected_title = f"BTD Macro {version}"
+          if app_title != expected_title:
+              raise SystemExit(
+                  f"APP_TITLE must be {expected_title!r}; found {app_title!r}."
+              )
+          print(f"Validated filename and application title: {expected_title}")
+          PY
           echo "mode=release" >> "$GITHUB_OUTPUT"
           echo "file=$file" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
