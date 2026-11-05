@@ -1763,6 +1763,12 @@ finally:
         set_focus = user32.SetFocus
         set_focus.argtypes = [wintypes.HWND]
         set_focus.restype = wintypes.HWND
+        is_child = user32.IsChild
+        is_child.argtypes = [wintypes.HWND, wintypes.HWND]
+        is_child.restype = wintypes.BOOL
+        get_foreground = user32.GetForegroundWindow
+        get_foreground.argtypes = []
+        get_foreground.restype = wintypes.HWND
 
         class GUITHREADINFO(ctypes.Structure):
             _fields_ = [
@@ -1804,15 +1810,19 @@ finally:
 
             focus_hwnd = int(info.hwndFocus or 0)
             target_hwnd = int(self.docked_hwnd)
-            return bool(
+            focus_matches = bool(
                 focus_hwnd == target_hwnd
                 or (
                     focus_hwnd
-                    and user32.IsChild(
+                    and is_child(
                         wintypes.HWND(target_hwnd), wintypes.HWND(focus_hwnd)
                     )
                 )
             )
+            foreground_matches = (
+                int(get_foreground() or 0) == int(root_hwnd)
+            )
+            return focus_matches and foreground_matches
         finally:
             if attached:
                 attach_thread_input(current_thread, target_thread, False)
@@ -1836,13 +1846,16 @@ finally:
         """Handle inactive game-panel clicks without discarding their mouse-down."""
         if message == 0x0021 and self.docked_hwnd is not None:  # WM_MOUSEACTIVATE
             try:
-                self._activate_embedded_roblox_input()
+                focus_confirmed = self._activate_embedded_roblox_input()
                 self.root.after_idle(self._focus_embedded_roblox)
+                # If our direct activation worked, don't run a second default
+                # activation pass. Otherwise let Windows activate the host.
+                return 3 if focus_confirmed else 1  # MA_NOACTIVATE / MA_ACTIVATE
             except Exception as exc:
                 if not self._input_focus_warning_logged:
                     self._input_focus_warning_logged = True
                     self.append_log(f"Roblox mouse-activation focus failed: {exc}")
-            # MA_ACTIVATE activates the top-level and preserves the click.
+            # MA_ACTIVATE preserves the original mouse-down if our bridge failed.
             return 1
 
         if self._input_bridge_old_proc and self._input_bridge_user32 is not None:
