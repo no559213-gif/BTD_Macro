@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 import urllib.error
 import urllib.request
@@ -1991,6 +1992,7 @@ def _migrate_legacy_filename_worker(
             root.after(0, warn_and_close)
 
     except Exception as exc:
+        error_text = str(exc)
         rollback_errors = []
         if process is not None and process.poll() is None:
             try:
@@ -2017,7 +2019,7 @@ def _migrate_legacy_filename_worker(
                     "BTD Macro Filename Migration Failed",
                     "The application will keep running under its current filename. "
                     "No previous script was intentionally removed.\n\n"
-                    + str(exc)
+                    + error_text
                     + (("\n\n" + "\n".join(rollback_errors)) if rollback_errors else ""),
                     parent=root
                 )
