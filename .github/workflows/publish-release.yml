@@ -1,0 +1,122 @@
+name: Publish BTD Macro Releases
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "BTD_Macro_*.py"
+      - "PUBLISH_TEST.md"
+      - ".github/workflows/publish-release.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Identify release or publishing test
+        id: plan
+        shell: bash
+        env:
+          EVENT_BEFORE: ${{ github.event.before }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${COMMIT_MESSAGE}" == *"[release-test]"* ]]; then
+            echo "mode=test" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          mapfile -t changed_files < <(git diff --name-only "${EVENT_BEFORE}" "${GITHUB_SHA}")
+          candidates=()
+          for path in "${changed_files[@]}"; do
+            if [[ "$path" =~ ^BTD_Macro_([0-9]+\.[0-9]+\.[0-9]+)\.py$ ]]; then
+              candidates+=("$path")
+            fi
+          done
+
+          if [[ ${#candidates[@]} -eq 0 ]]; then
+            echo "mode=skip" >> "$GITHUB_OUTPUT"
+            echo "No versioned BTD Macro Python file changed. No release will be created."
+            exit 0
+          fi
+
+          if [[ ${#candidates[@]} -ne 1 ]]; then
+            echo "::error::Expected exactly one versioned BTD_Macro Python file per commit."
+            exit 1
+          fi
+
+          file="${candidates[0]}"
+          if [[ ! -f "$file" ]]; then
+            echo "::error::The versioned Python file is missing from the checkout."
+            exit 1
+          fi
+
+          filename="${file##*/}"
+          version="${filename#BTD_Macro_}"
+          version="${version%.py}"
+
+          python -m py_compile "$file"
+          echo "mode=release" >> "$GITHUB_OUTPUT"
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Test release creation and asset upload (temporary draft)
+        if: steps.plan.outputs.mode == 'test'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v0.0.0-publish-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() {
+            gh release delete "$tag" --cleanup-tag --yes >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          gh release create "$tag" PUBLISH_TEST.md \
+            --draft \
+            --title "Temporary BTD Macro Publishing Test" \
+            --notes "Temporary draft used to verify GitHub Actions release and asset-upload permissions. This draft is deleted automatically."
+
+          uploaded_asset="$(gh release view "$tag" --json assets --jq '[.assets[].name] | index("PUBLISH_TEST.md")')"
+          if [[ "$uploaded_asset" == "null" || -z "$uploaded_asset" ]]; then
+            echo "::error::The test asset was not present on the temporary draft release."
+            exit 1
+          fi
+
+          echo "Verified draft release creation and PUBLISH_TEST.md asset upload."
+          cleanup
+          trap - EXIT
+          echo "Temporary test release and tag were deleted."
+
+      - name: Publish versioned Python release
+        if: steps.plan.outputs.mode == 'release'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_FILE: ${{ steps.plan.outputs.file }}
+          RELEASE_VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v${RELEASE_VERSION}"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::Release $tag already exists. Refusing to overwrite it."
+            exit 1
+          fi
+
+          gh release create "$tag" "$RELEASE_FILE" \
+            --target "$GITHUB_SHA" \
+            --title "BTD Macro ${RELEASE_VERSION}" \
+            --notes "BTD Macro ${RELEASE_VERSION} release."
+
+          echo "Published $tag with asset $RELEASE_FILE."
