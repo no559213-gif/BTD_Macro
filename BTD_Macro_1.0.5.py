@@ -1891,6 +1891,163 @@ def _write_update_startup_marker(marker_path: str, expected_version: str) -> Non
         pass
 
 
+def _migrate_legacy_filename_worker(
+    root: tk.Tk, old_path: Path, new_path: Path, launch_args: list[str]
+) -> None:
+    """Move a first-upgrade install left under the old updater's filename."""
+    process = None
+    staging_path = None
+    marker_path = Path(tempfile.gettempdir()) / (
+        f"btd_macro_legacy_migration_{os.getpid()}_{APP_VERSION}.txt"
+    )
+    backup_path = new_path.with_name(
+        f".{new_path.name}.{os.getpid()}.migration-backup"
+    )
+    moved_existing = False
+    installed_new = False
+
+    def remove_with_retry(path: Path, attempts: int = 20) -> bool:
+        for _ in range(attempts):
+            try:
+                path.unlink()
+                return True
+            except FileNotFoundError:
+                return True
+            except OSError:
+                time.sleep(0.25)
+        return False
+
+    try:
+        if new_path.exists():
+            if backup_path.exists():
+                raise RuntimeError("A prior migration backup already exists.")
+            os.replace(new_path, backup_path)
+            moved_existing = True
+
+        handle, staging_path = tempfile.mkstemp(
+            prefix=f".{new_path.stem}.", suffix=".migration.py",
+            dir=str(new_path.parent)
+        )
+        with os.fdopen(handle, "wb") as output, old_path.open("rb") as source:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+
+        os.replace(staging_path, new_path)
+        staging_path = None
+        installed_new = True
+
+        launch_env = os.environ.copy()
+        launch_env["BTD_MACRO_UPDATE_STARTUP_MARKER"] = str(marker_path)
+        launch_env["BTD_MACRO_EXPECTED_VERSION"] = APP_VERSION
+        process = subprocess.Popen(
+            [sys.executable, str(new_path), *launch_args],
+            cwd=str(old_path.parent),
+            env=launch_env,
+            close_fds=True
+        )
+
+        deadline = time.monotonic() + 35.0
+        confirmed = False
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError("The correctly named copy exited before confirming startup.")
+            if marker_path.is_file():
+                try:
+                    marker_version = marker_path.read_text(encoding="utf-8").strip()
+                except OSError:
+                    marker_version = ""
+                if marker_version == APP_VERSION:
+                    time.sleep(2.5)
+                    if process.poll() is not None:
+                        raise RuntimeError("The correctly named copy exited immediately after startup.")
+                    confirmed = True
+                    break
+            time.sleep(0.25)
+
+        if not confirmed:
+            raise RuntimeError("The correctly named copy did not confirm startup.")
+
+        old_deleted = remove_with_retry(old_path)
+        if moved_existing:
+            remove_with_retry(backup_path)
+
+        if old_deleted:
+            root.after(0, root.destroy)
+        else:
+            def warn_and_close() -> None:
+                messagebox.showwarning(
+                    "BTD Macro Filename Migration",
+                    "BTD Macro 1.0.5 is running from its correct filename, but "
+                    "Windows would not let the old script filename be deleted. "
+                    "You can remove that old .py file manually.",
+                    parent=root
+                )
+                root.destroy()
+            root.after(0, warn_and_close)
+
+    except Exception as exc:
+        rollback_errors = []
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
+        if installed_new and not remove_with_retry(new_path):
+            rollback_errors.append("Could not remove the failed versioned copy.")
+        if moved_existing and backup_path.exists():
+            try:
+                os.replace(backup_path, new_path)
+            except OSError as rollback_error:
+                rollback_errors.append("Could not restore the existing versioned copy: " + str(rollback_error))
+
+        def restore_old_window() -> None:
+            try:
+                root.deiconify()
+                messagebox.showerror(
+                    "BTD Macro Filename Migration Failed",
+                    "The application will keep running under its current filename. "
+                    "No previous script was intentionally removed.\n\n"
+                    + str(exc)
+                    + (("\n\n" + "\n".join(rollback_errors)) if rollback_errors else ""),
+                    parent=root
+                )
+            except tk.TclError:
+                pass
+        root.after(0, restore_old_window)
+
+    finally:
+        if staging_path:
+            remove_with_retry(Path(staging_path))
+        remove_with_retry(marker_path)
+
+
+def _begin_legacy_filename_migration(root: tk.Tk) -> None:
+    current_path = Path(__file__).resolve()
+    expected_path = current_path.with_name(f"BTD_Macro_{APP_VERSION}.py")
+    if current_path.name.casefold() == expected_path.name.casefold():
+        return
+
+    # 1.0.4's older updater checked that the replacement stayed alive for
+    # eight seconds. Delay this one-time rename so that check completes first.
+    root.withdraw()
+    threading.Thread(
+        target=_migrate_legacy_filename_worker,
+        args=(root, current_path, expected_path, sys.argv[1:]),
+        name="BTDLegacyFilenameMigration",
+        daemon=True
+    ).start()
+
+
 def main() -> None:
     configure_process_dpi_awareness()
     marker_path = os.environ.pop("BTD_MACRO_UPDATE_STARTUP_MARKER", None)
@@ -1899,6 +2056,8 @@ def main() -> None:
     BTDGui(root)
     if marker_path and expected_version:
         root.after(1200, _write_update_startup_marker, marker_path, expected_version)
+    else:
+        root.after(15000, _begin_legacy_filename_migration, root)
     root.mainloop()
 
 
