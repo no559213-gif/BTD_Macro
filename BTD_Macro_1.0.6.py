@@ -2239,7 +2239,28 @@ def _begin_legacy_filename_migration(root: tk.Tk) -> None:
     ).start()
 
 
+def detach_gui_console() -> None:
+    """Detach from a console if an older updater or file association launched python.exe."""
+    if os.name != "nt" or Path(sys.executable).name.lower() == "pythonw.exe":
+        return
+    try:
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_console_window = kernel32.GetConsoleWindow
+        get_console_window.argtypes = []
+        get_console_window.restype = wintypes.HWND
+        free_console = kernel32.FreeConsole
+        free_console.argtypes = []
+        free_console.restype = wintypes.BOOL
+        if get_console_window():
+            free_console()
+    except Exception:
+        # The UI remains usable even where console detachment is unavailable.
+        pass
+
+
 def main() -> None:
+    detach_gui_console()
     configure_process_dpi_awareness()
     marker_path = os.environ.pop("BTD_MACRO_UPDATE_STARTUP_MARKER", None)
     expected_version = os.environ.pop("BTD_MACRO_EXPECTED_VERSION", None)
