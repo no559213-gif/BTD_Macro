@@ -3209,7 +3209,7 @@ finally:
         finally:
             self._arranging_windows = False
 
-        def _on_game_host_configure(self, event=None) -> None:
+    def _on_game_host_configure(self, event=None) -> None:
         if event is not None and event.widget is not self.game_host:
             return
         if self.docked_hwnd is not None and not self._arranging_windows:
@@ -3418,7 +3418,7 @@ finally:
         if errors:
             raise RuntimeError(" | ".join(errors))
 
-        def undock_roblox(self) -> bool:
+    def undock_roblox(self) -> bool:
         if self.docked_hwnd is None:
             return True
 
