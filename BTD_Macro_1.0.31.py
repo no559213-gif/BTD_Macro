@@ -623,7 +623,7 @@ class BTDGui:
 
         tk.Label(
             content,
-            text="Record lobby controls with F3. Import map-card reference images in Map Detection.",
+            text="Record lobby controls with F3. Re-record MAP SCROLL AREA at expanded size; import map-art crops in Map Detection.",
             bg=BG, fg=MUTED, font=("Segoe UI", 8), wraplength=480,
             justify="left"
         ).pack(anchor="w", pady=(12, 0))
@@ -889,7 +889,7 @@ class BTDGui:
         ).pack(anchor="w")
         tk.Label(
             content,
-            text="Preview or temporarily expand Roblox in windowed mode. For F3, arm capture in Macro first, expand here, hover MAP SCROLL AREA, then press F3. Press F8 to restore.",
+            text="Open the map selector first. Arm MAP SCROLL AREA capture in Macro, expand here, hover the list in Roblox and press F3. Press F8 to restore.",
             bg=BG, fg=MUTED, font=("Segoe UI", 8), wraplength=355,
             justify="left"
         ).pack(anchor="w", pady=(3, 10))
@@ -978,7 +978,7 @@ class BTDGui:
         self.map_detection_test_button.pack(fill="x", padx=8, pady=(0, 8))
 
         self.map_detection_result_var = tk.StringVar(
-            value="Choose a map in Macro, import its tightly cropped card image, then test."
+            value="Choose a map in Macro, import a tightly cropped map-art image, then test."
         )
         tk.Label(
             content, textvariable=self.map_detection_result_var, bg=BG,
@@ -1122,6 +1122,34 @@ class BTDGui:
             "work_width": int(work_right - work_left),
             "work_height": int(work_bottom - work_top)
         }
+
+    def _map_detection_scroll_point(self, hwnd: int) -> tuple[int, int]:
+        """Require MAP SCROLL AREA to be captured in the expanded client layout."""
+        record = self.button_positions.get("MAP SCROLL AREA")
+        if not isinstance(record, dict):
+            raise RuntimeError(
+                "MAP SCROLL AREA is missing. Select it in Macro, arm F3, expand Roblox, "
+                "hover the open map list, and press F3."
+            )
+        metrics = self._get_roblox_client_metrics(hwnd)
+        current_width = metrics["client_width"]
+        current_height = metrics["client_height"]
+        saved_width = int(record.get("client_width", 0))
+        saved_height = int(record.get("client_height", 0))
+        tolerance_x = max(24, int(current_width * 0.03))
+        tolerance_y = max(24, int(current_height * 0.03))
+        if (
+            saved_width <= 0 or saved_height <= 0
+            or abs(saved_width - current_width) > tolerance_x
+            or abs(saved_height - current_height) > tolerance_y
+        ):
+            raise RuntimeError(
+                "MAP SCROLL AREA was not captured at the current expanded Roblox size. "
+                f"Saved client={saved_width}x{saved_height}; current client="
+                f"{current_width}x{current_height}. Re-record MAP SCROLL AREA with F3 "
+                "while Roblox is expanded and the map selector is open."
+            )
+        return self._lobby_screen_point(hwnd, "MAP SCROLL AREA")
 
     def _update_map_detection_size(self, metrics: dict) -> None:
         self.map_detection_size_var.set(
@@ -1356,7 +1384,7 @@ class BTDGui:
                     success=True
                 )
                 return
-            scroll_point = self._lobby_screen_point(hwnd, "MAP SCROLL AREA")
+            scroll_point = self._map_detection_scroll_point(hwnd)
             state["scroll_point"] = scroll_point
             win32api.SetCursorPos(scroll_point)
             self.map_detection_result_var.set(
@@ -1597,7 +1625,7 @@ class BTDGui:
     # Macro tab: Roblox button position capture
     # ------------------------------------------------------------------
     def _position_target_options(self) -> list[str]:
-        """Return shared lobby controls, the map-list scroll area, and map targets."""
+        """Return fixed lobby controls plus the map-list scroll area for detection."""
         # Map cards move and overlap when Roblox changes size. Use image detection,
         # not saved per-map coordinates.
         return [
@@ -2258,7 +2286,7 @@ class BTDGui:
         if reference_path is None:
             message = (
                 f"No reference image is installed for {map_name}. Open Map Detection "
-                "and import a tightly cropped image of that map card first."
+                "and import a tightly cropped map-art image first."
             )
             self.set_status(message, "warning")
             self.append_log("Lobby sequence not started: " + message)
@@ -2537,7 +2565,7 @@ class BTDGui:
         if self._map_reference_path(map_name) is None:
             raise RuntimeError(
                 f"No map reference image is installed for {map_name}. "
-                "Import a cropped card image in the Map Detection tab."
+                "Import a cropped map-art image in the Map Detection tab."
             )
         self._require_map_detection_libraries()
         scroll_point = self._lobby_screen_point(hwnd, "MAP SCROLL AREA")
