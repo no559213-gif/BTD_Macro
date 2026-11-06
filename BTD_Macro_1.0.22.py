@@ -1442,10 +1442,19 @@ class BTDGui:
                     and width > 0 and height > 0
                     and 0 <= x < width and 0 <= y < height
                 ):
-                    valid[target] = {
+                    valid_record = {
                         "x": x, "y": y,
                         "client_width": width, "client_height": height
                     }
+                    pixel_rgb = record.get("pixel_rgb")
+                    if (
+                        isinstance(pixel_rgb, (list, tuple))
+                        and len(pixel_rgb) == 3
+                        and all(type(channel) is int and 0 <= channel <= 255
+                                for channel in pixel_rgb)
+                    ):
+                        valid_record["pixel_rgb"] = list(pixel_rgb)
+                    valid[target] = valid_record
             return valid
         except FileNotFoundError:
             return {}
@@ -1481,6 +1490,8 @@ class BTDGui:
                 f"Saved: ({record['x']}, {record['y']}) relative to Roblox. "
                 f"{saved_count}/{total_count} positions recorded."
             )
+            if target == "KICK" and not record.get("pixel_rgb"):
+                detail += " Re-record with F8 to enable empty-party detection."
         else:
             detail = (
                 f"Not recorded yet. {saved_count}/{total_count} positions recorded."
@@ -1606,6 +1617,17 @@ class BTDGui:
                 "client_width": client_width,
                 "client_height": client_height
             }
+            if target == "KICK":
+                kick_pixel = self._get_screen_pixel_color(
+                    (int(screen_x), int(screen_y))
+                )
+                if kick_pixel is None:
+                    self.set_status(
+                        "Could not read KICK button color. Hover it and press F8 again.",
+                        "error"
+                    )
+                    return
+                record["pixel_rgb"] = list(kick_pixel)
             previous_record = self.button_positions.get(target)
             self.button_positions[target] = record
             self._save_button_positions()
@@ -1632,6 +1654,14 @@ class BTDGui:
         required = []
         if mode == "full":
             required.extend(["PLAY", "CREATE PARTY", "PRIVATE", "KICK"])
+            kick_record = self.button_positions.get("KICK", {})
+            pixel_rgb = kick_record.get("pixel_rgb") if isinstance(kick_record, dict) else None
+            if not (
+                isinstance(pixel_rgb, (list, tuple))
+                and len(pixel_rgb) == 3
+                and all(type(channel) is int and 0 <= channel <= 255 for channel in pixel_rgb)
+            ):
+                required.append("KICK (re-record with F8 for empty-party detection)")
         required.extend(["CHANGE MAP", f"MAP — {map_name}"])
         if mode == "full":
             required.append("START")
@@ -1919,19 +1949,41 @@ class BTDGui:
 
     def _lobby_kick_button_ready(self, hwnd: int, target: tuple[int, int]) -> None:
         self._lobby_sequence_kick_point = target
-        before_color = self._get_screen_pixel_color(target)
-        self.append_log(f"KICK control pixel before click: {before_color}.")
-        self._lobby_click_ready(hwnd, target, self._lobby_after_kick, (before_color,))
+        current_color = self._get_screen_pixel_color(target)
+        kick_record = self.button_positions.get("KICK", {})
+        reference_raw = kick_record.get("pixel_rgb") if isinstance(kick_record, dict) else None
+        if current_color is None or not isinstance(reference_raw, (list, tuple)) or len(reference_raw) != 3:
+            raise RuntimeError("KICK visual reference is unavailable. Re-record KICK with F8.")
+        reference_color = tuple(int(channel) for channel in reference_raw)
+        initial_delta = sum(abs(current_color[i] - reference_color[i]) for i in range(3))
+        self.append_log(
+            f"KICK pixel check: saved reference={reference_color}, "
+            f"current={current_color}, difference={initial_delta}."
+        )
+        if initial_delta >= KICK_PIXEL_CHANGE_THRESHOLD:
+            self.append_log(
+                "The saved KICK button appearance is not present at its recorded point; "
+                "assuming there are no party members left to kick."
+            )
+            self._lobby_after_kicks(hwnd)
+            return
+        self._lobby_click_ready(hwnd, target, self._lobby_after_kick, (reference_color,))
 
-    def _lobby_after_kick(self, hwnd: int, before_color: tuple[int, int, int] | None) -> None:
+    def _lobby_after_kick(self, hwnd: int, reference_color: tuple[int, int, int]) -> None:
         self._lobby_sequence_kick_count += 1
         point = self._lobby_sequence_kick_point
         after_color = self._get_screen_pixel_color(point) if point else None
-        self.append_log(f"KICK attempt {self._lobby_sequence_kick_count}: before={before_color}, after={after_color}.")
-        if before_color is not None and after_color is not None:
-            color_delta = sum(abs(before_color[i] - after_color[i]) for i in range(3))
+        self.append_log(
+            f"KICK attempt {self._lobby_sequence_kick_count}: "
+            f"reference={reference_color}, after={after_color}."
+        )
+        if after_color is not None:
+            color_delta = sum(abs(reference_color[i] - after_color[i]) for i in range(3))
             if color_delta >= KICK_PIXEL_CHANGE_THRESHOLD:
-                self.append_log(f"KICK point changed by {color_delta}; treating the KICK control as no longer present.")
+                self.append_log(
+                    f"KICK point differs from its saved button appearance by {color_delta}; "
+                    "treating the KICK control as no longer present."
+                )
                 self._lobby_after_kicks(hwnd)
                 return
         if self._lobby_sequence_kick_count >= KICK_MAX_ATTEMPTS:
