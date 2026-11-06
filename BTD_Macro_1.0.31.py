@@ -2651,15 +2651,20 @@ class BTDGui:
         self._lobby_require_focus(hwnd)
         screenshot, origin, metrics = self._capture_roblox_client_image(hwnd)
         match = self._match_map_reference(map_name, screenshot)
-        if match is not None and match["score"] >= MAP_DETECTION_THRESHOLD:
+        if (
+            match is not None
+            and match["score"] >= MAP_DETECTION_THRESHOLD
+            and match.get("margin", 0.0) >= MAP_DETECTION_MIN_MARGIN
+        ):
             center = match["center"]
             screen_target = (origin[0] + center[0], origin[1] + center[1])
             self.append_log(
                 f"Map detector found {map_name}: confidence={match['score']:.3f}, "
-                f"client_box={match['box']}."
+                f"separation={match['margin']:.3f}, client_box={match['box']}."
             )
             self.set_status(
-                f"{map_name} detected ({match['score']:.0%}); selecting…", "success"
+                f"{map_name} detected ({match['score']:.0%}); selecting…"
+, "success"
             )
             self._lobby_move_to_detected_map(hwnd, map_name, screen_target)
             return
