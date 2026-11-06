@@ -224,6 +224,7 @@ class BTDGui:
         self._arranging_windows = False
         self._overlay_position_pending = False
         self._dock_sync_after_id = None
+        self._dock_last_foreground = None
         self.recording_names: list[str] = []
         self.currently_loaded_recording: str | None = None
 
@@ -350,6 +351,7 @@ class BTDGui:
                 return
 
             root_state = self.root.state()
+            root_hwnd = int(self.root.winfo_id())
             foreground = int(win32gui.GetForegroundWindow() or 0)
             if root_state == "iconic":
                 if foreground == hwnd:
@@ -359,6 +361,11 @@ class BTDGui:
                     self.root.after(100, lambda: self._schedule_overlay_position(show=True))
                 elif not win32gui.IsIconic(hwnd):
                     win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+            elif foreground in (root_hwnd, hwnd) and foreground != self._dock_last_foreground:
+                # If the user returns through either taskbar button, restore the
+                # two-window Z-order pair without activating the other window.
+                self._schedule_overlay_position(show=True)
+            self._dock_last_foreground = foreground
         except Exception as exc:
             self.append_log(f"WARNING synchronizing docked Roblox state: {exc}")
         finally:
@@ -3172,11 +3179,19 @@ finally:
             if force:
                 flags |= win32con.SWP_FRAMECHANGED
 
-            # Do not raise the unowned game window above unrelated applications.
-            # Raise it only while BTD Macro or Roblox is the foreground window.
+            # Keep the Macro host and game overlay together at the top of the
+            # normal (non-topmost) Z order only while either one is foreground.
+            # First raise the host, then the game so the right-side Macro controls
+            # remain visible while Roblox has focus. Other apps can still cover both.
             root_hwnd = int(self.root.winfo_id())
             foreground = int(win32gui.GetForegroundWindow() or 0)
-            if foreground not in (root_hwnd, hwnd):
+            if foreground in (root_hwnd, hwnd):
+                group_flags = (
+                    win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+                    | win32con.SWP_NOACTIVATE
+                )
+                win32gui.SetWindowPos(root_hwnd, 0, 0, 0, 0, 0, group_flags)
+            else:
                 flags |= win32con.SWP_NOZORDER
 
             win32gui.SetWindowPos(
