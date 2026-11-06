@@ -3255,6 +3255,15 @@ finally:
             return False
 
     def close_app(self) -> None:
+        # Cancel pending lobby callbacks and release a held mouse button before
+        # restoring Roblox or destroying the Tk event loop.
+        if self._lobby_sequence_active:
+            self._finish_lobby_sequence(
+                False, "Cancelled because BTD Macro is closing."
+            )
+        if self._position_capture_armed:
+            self._stop_position_capture()
+
         # An owned window is destroyed with its owner. Restore Roblox before
         # destroying the Tk root and verify it is no longer owned by this app.
         hwnd = self.docked_hwnd
