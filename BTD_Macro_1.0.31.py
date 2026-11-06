@@ -914,7 +914,7 @@ class BTDGui:
         )
         preview_panel.pack(fill="both", expand=True)
         tk.Label(
-            preview_panel, text="LIVE ROBLOX SCREENSHOT PREVIEW",
+            preview_panel, text="CAPTURED ROBLOX SCREENSHOT PREVIEW",
             bg="#090D14", fg=MUTED, font=("Segoe UI Semibold", 8)
         ).pack(anchor="w", padx=8, pady=(7, 4))
         self.map_detection_preview_label = tk.Label(
@@ -2069,6 +2069,9 @@ class BTDGui:
             for target, record in raw_positions.items():
                 if not isinstance(target, str) or not isinstance(record, dict):
                     continue
+                if target.startswith("MAP — "):
+                    # Fixed map-card coordinates are obsolete; visual matching locates map cards.
+                    continue
                 x = record.get("x")
                 y = record.get("y")
                 width = record.get("client_width")
@@ -2111,8 +2114,9 @@ class BTDGui:
             return
         target = self.position_target_var.get().strip()
         record = self.button_positions.get(target)
-        saved_count = len(self.button_positions)
-        total_count = len(self._position_target_options())
+        active_targets = self._position_target_options()
+        saved_count = sum(1 for name in active_targets if name in self.button_positions)
+        total_count = len(active_targets)
         if record:
             detail = (
                 f"Saved: ({record['x']}, {record['y']}) relative to Roblox. "
@@ -2290,6 +2294,12 @@ class BTDGui:
             )
             self.set_status(message, "warning")
             self.append_log("Lobby sequence not started: " + message)
+            return
+        try:
+            self._require_map_detection_libraries()
+        except Exception as exc:
+            self.set_status(f"Map detection is not ready: {exc}", "error")
+            self.append_log(f"Lobby sequence not started because map detection is unavailable: {exc}")
             return
 
         missing = self._validate_lobby_positions(map_name, mode)
