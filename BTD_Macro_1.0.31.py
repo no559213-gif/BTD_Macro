@@ -1374,6 +1374,7 @@ class BTDGui:
                 "F8 will restore the saved docked rectangle."
             )
         except Exception as exc:
+            self._restore_roblox_preview_window()
             self.map_detection_result_var.set(f"Could not expand Roblox: {exc}")
             self.set_status(f"Could not expand Roblox: {exc}", "warning")
 
@@ -1505,7 +1506,10 @@ class BTDGui:
                 return
             down = state["down_notches"]
             if down >= MAP_DETECTION_MAX_DOWN_NOTCHES:
-                score_text = f"{match['score']:.1%}" if match else "no match"
+                score_text = (
+                    f"{match['score']:.1%} with {match.get('margin', 0.0):.1%} separation"
+                    if match else "no match"
+                )
                 self._finish_map_detection_test(
                     f"Could not uniquely identify {state['map_name']} (best candidate {score_text}). "
                     "No map was clicked. Check the reference crop and whether the card is obscured.",
