@@ -889,7 +889,7 @@ class BTDGui:
         ).pack(anchor="w")
         tk.Label(
             content,
-            text="Preview Roblox at the expanded windowed size, import a cropped map-card reference, and test recognition without clicking.",
+            text="Preview or temporarily expand Roblox in windowed mode. For F3, arm capture in Macro first, expand here, hover MAP SCROLL AREA, then press F3. Press F8 to restore.",
             bg=BG, fg=MUTED, font=("Segoe UI", 8), wraplength=355,
             justify="left"
         ).pack(anchor="w", pady=(3, 10))
@@ -954,6 +954,13 @@ class BTDGui:
             bg=PANEL_ALT, fg=TEXT, active_bg=BORDER, small=True
         )
         self.map_reference_folder_button.pack(side="left", fill="x", expand=True, padx=(3, 0))
+
+        self.map_expand_button = self._make_button(
+            action_panel, "EXPAND ROBLOX FOR SCREENSHOTS / F3",
+            self.expand_roblox_for_manual_capture,
+            bg=PANEL_ALT, fg=TEXT, active_bg=BORDER, small=True
+        )
+        self.map_expand_button.pack(fill="x", padx=8, pady=(0, 6))
 
         import_row = tk.Frame(action_panel, bg=PANEL)
         import_row.pack(fill="x", padx=8, pady=(0, 6))
@@ -1061,15 +1068,25 @@ class BTDGui:
         except Exception as exc:
             self.map_detection_result_var.set(f"Could not open the reference folder: {exc}")
 
-    def _require_map_detection_libraries(self):
+    def _require_map_capture_libraries(self):
         try:
             from PIL import Image, ImageDraw, ImageGrab, ImageTk
+        except ImportError as exc:
+            raise RuntimeError(
+                "Roblox screenshot preview needs Pillow. Install with: "
+                "python -m pip install pillow"
+            ) from exc
+        return Image, ImageDraw, ImageGrab, ImageTk
+
+    def _require_map_detection_libraries(self):
+        Image, ImageDraw, ImageGrab, ImageTk = self._require_map_capture_libraries()
+        try:
             import cv2
             import numpy as np
         except ImportError as exc:
             raise RuntimeError(
-                "Map detection needs Pillow and OpenCV. Install with: "
-                "python -m pip install pillow opencv-python"
+                "Map matching needs OpenCV. Install with: "
+                "python -m pip install opencv-python"
             ) from exc
         return Image, ImageDraw, ImageGrab, ImageTk, cv2, np
 
@@ -1162,7 +1179,7 @@ class BTDGui:
             self.append_log(f"WARNING restoring Roblox after map detection: {exc}")
 
     def _capture_roblox_client_image(self, hwnd: int):
-        Image, ImageDraw, ImageGrab, ImageTk, cv2, np = self._require_map_detection_libraries()
+        Image, ImageDraw, ImageGrab, ImageTk = self._require_map_capture_libraries()
         metrics = self._get_roblox_client_metrics(hwnd)
         width = metrics["client_width"]
         height = metrics["client_height"]
@@ -1229,7 +1246,7 @@ class BTDGui:
 
     def _show_map_detection_preview(self, screenshot, match=None) -> None:
         try:
-            Image, ImageDraw, ImageGrab, ImageTk, cv2, np = self._require_map_detection_libraries()
+            Image, ImageDraw, ImageGrab, ImageTk = self._require_map_capture_libraries()
             preview = screenshot.copy()
             if match and match.get("box"):
                 draw = ImageDraw.Draw(preview)
@@ -1247,6 +1264,31 @@ class BTDGui:
             self.map_detection_preview_label.configure(
                 image="", text=f"Preview unavailable: {exc}"
             )
+
+    def expand_roblox_for_manual_capture(self) -> None:
+        """Leave Roblox expanded so the user can capture references or re-record F3 points."""
+        if self._lobby_sequence_active or self._roblox_scroll_test_active or self._map_detection_test_active:
+            self.map_detection_result_var.set(
+                "Stop the active task before manually expanding Roblox."
+            )
+            return
+        try:
+            hwnd = self._get_roblox_hwnd_for_detection()
+            self._expand_roblox_for_map_detection(hwnd)
+            metrics = self._get_roblox_client_metrics(hwnd)
+            self._update_map_detection_size(metrics)
+            self.map_detection_result_var.set(
+                "Roblox is expanded in windowed mode. Take map-card screenshots or re-record "
+                "MAP SCROLL AREA with F3. Press F8 to restore the docked size."
+            )
+            self.set_status("Roblox expanded for screenshots / F3 capture. Press F8 to restore.")
+            self.append_log(
+                "Roblox left expanded for manual map screenshots or F3 coordinate capture; "
+                "F8 will restore the saved docked rectangle."
+            )
+        except Exception as exc:
+            self.map_detection_result_var.set(f"Could not expand Roblox: {exc}")
+            self.set_status(f"Could not expand Roblox: {exc}", "warning")
 
     def preview_roblox_map_size(self) -> None:
         self._begin_map_detection_test(preview_only=True)
@@ -1266,7 +1308,10 @@ class BTDGui:
             return
         try:
             hwnd = self._get_roblox_hwnd_for_detection()
-            self._require_map_detection_libraries()
+            if preview_only:
+                self._require_map_capture_libraries()
+            else:
+                self._require_map_detection_libraries()
             if not preview_only and self._map_reference_path(map_name) is None:
                 raise RuntimeError(
                     f"No reference image is installed for {map_name}. Import a tightly cropped "
@@ -2659,6 +2704,7 @@ class BTDGui:
     def universal_stop(self) -> None:
         """F8 emergency stop: cancel automation, disarm capture, release inputs."""
         stopped = []
+        was_preview_expanded = self._map_preview_original_rect is not None
         self._stop_position_capture()
         if self._lobby_sequence_active:
             self._finish_lobby_sequence(False, "Emergency STOP pressed (F8).")
@@ -2674,6 +2720,8 @@ class BTDGui:
             stopped.append("map detection test")
         self._release_macro_inputs()
         self._restore_roblox_preview_window()
+        if was_preview_expanded and not stopped:
+            stopped.append("expanded Roblox preview")
         detail = ", ".join(stopped) if stopped else "no active task"
         self.set_status(f"UNIVERSAL STOP (F8) — stopped {detail}.", "warning")
         self.append_log(
