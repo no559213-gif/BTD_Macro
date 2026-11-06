@@ -162,6 +162,7 @@ LOBBY_CLICK_HOLD_MS = 55
 KICK_MAX_ATTEMPTS = 10
 
 MAP_DETECTION_THRESHOLD = 0.82
+MAP_DETECTION_MIN_MARGIN = 0.025
 MAP_DETECTION_RESET_NOTCHES = 10
 MAP_DETECTION_MAX_DOWN_NOTCHES = 9
 MAP_DETECTION_SCROLL_INTERVAL_MS = 80
@@ -1220,19 +1221,25 @@ class BTDGui:
         return screenshot, (int(left), int(top)), metrics
 
     def _match_map_reference(self, map_name: str, screenshot):
-        """Template-match a single cropped map card and fail closed below threshold."""
+        """Template-match a cropped map card and measure the runner-up ambiguity."""
         reference_path = self._map_reference_path(map_name)
         if reference_path is None:
             raise RuntimeError(
-                f"No reference image is installed for {map_name}. Import its cropped card image."
+                f"No reference image is installed for {map_name}. Import its cropped map-art image."
             )
         Image, ImageDraw, ImageGrab, ImageTk, cv2, np = self._require_map_detection_libraries()
         template = cv2.imread(str(reference_path), cv2.IMREAD_GRAYSCALE)
         if template is None:
             raise RuntimeError(f"OpenCV could not read map reference: {reference_path.name}.")
+        if float(np.std(template)) < 3.0:
+            raise RuntimeError(
+                "The reference crop has too little visual detail. Crop the map artwork and/or "
+                "visible name more tightly, avoiding flat borders or blank areas."
+            )
+
         screen_rgb = np.asarray(screenshot.convert("RGB"))
         screen_gray = cv2.cvtColor(screen_rgb, cv2.COLOR_RGB2GRAY)
-        # Downsample the search to half-size to keep processing light on low-spec PCs.
+        # Downsample the screen to half-size to keep matching light on low-spec PCs.
         screen_gray = cv2.resize(
             screen_gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA
         )
@@ -1240,7 +1247,9 @@ class BTDGui:
             raise RuntimeError(
                 "The selected reference is larger than the Roblox client. Crop it to the map card."
             )
+
         best_score = -1.0
+        best_second_score = -1.0
         best_box = None
         for scale in (0.90, 1.0, 1.10):
             scaled = cv2.resize(
@@ -1253,21 +1262,43 @@ class BTDGui:
                 or scaled.shape[1] > screen_gray.shape[1]
             ):
                 continue
+
             result = cv2.matchTemplate(screen_gray, scaled, cv2.TM_CCOEFF_NORMED)
             _minimum, maximum, _min_location, max_location = cv2.minMaxLoc(result)
             score = float(maximum)
+
+            # Mask the winning card-sized neighbourhood, then measure the next
+            # strongest spatially separate candidate to avoid guessing between twins.
+            runner_up_map = result.copy()
+            peak_x, peak_y = max_location
+            pad_x = max(1, int(scaled.shape[1] * 0.75))
+            pad_y = max(1, int(scaled.shape[0] * 0.75))
+            left = max(0, peak_x - pad_x)
+            top = max(0, peak_y - pad_y)
+            right = min(runner_up_map.shape[1], peak_x + pad_x + 1)
+            bottom = min(runner_up_map.shape[0], peak_y + pad_y + 1)
+            runner_up_map[top:bottom, left:right] = -1.0
+            _runner_min, runner_up, _runner_loc, _runner_point = cv2.minMaxLoc(runner_up_map)
+
             if score > best_score:
                 height, width = scaled.shape[:2]
                 best_score = score
+                best_second_score = float(runner_up)
                 best_box = (
                     int(max_location[0] * 2), int(max_location[1] * 2),
                     int(width * 2), int(height * 2)
                 )
+
         if best_box is None:
-            return {"score": 0.0, "box": None, "center": None}
+            return {
+                "score": 0.0, "second_score": 0.0,
+                "margin": 0.0, "box": None, "center": None
+            }
         x, y, width, height = best_box
         return {
             "score": best_score,
+            "second_score": best_second_score,
+            "margin": best_score - best_second_score,
             "box": best_box,
             "center": (x + width // 2, y + height // 2)
         }
@@ -1403,6 +1434,8 @@ class BTDGui:
             hwnd = self._map_detection_test_state["hwnd"]
             if not win32gui.IsWindow(hwnd):
                 raise RuntimeError("Roblox closed during the detection test.")
+            if int(win32gui.GetForegroundWindow() or 0) != hwnd:
+                raise RuntimeError("Roblox lost foreground focus; map scrolling cancelled.")
             if completed >= MAP_DETECTION_RESET_NOTCHES:
                 self._map_detection_after_id = self.root.after(
                     MAP_DETECTION_SETTLE_MS, self._map_detection_test_scan
@@ -1426,13 +1459,17 @@ class BTDGui:
             hwnd = state["hwnd"]
             if not win32gui.IsWindow(hwnd):
                 raise RuntimeError("Roblox closed during map detection.")
+            if int(win32gui.GetForegroundWindow() or 0) != hwnd:
+                raise RuntimeError("Roblox lost foreground focus; map detection cancelled.")
             screenshot, origin, metrics = self._capture_roblox_client_image(hwnd)
             match = self._match_map_reference(state["map_name"], screenshot)
             self._update_map_detection_size(metrics)
             self._show_map_detection_preview(screenshot, match)
-            if match is not None and match["score"] >= MAP_DETECTION_THRESHOLD:
+            if (match is not None and match["score"] >= MAP_DETECTION_THRESHOLD
+                and match.get("margin", 0.0) >= MAP_DETECTION_MIN_MARGIN):
                 self._finish_map_detection_test(
-                    f"FOUND {state['map_name']} — confidence {match['score']:.1%}; "
+                    f"FOUND {state['map_name']} — confidence {match['score']:.1%}, "
+                    f"separation {match['margin']:.1%}; "
                     f"card center at client ({match['center'][0]}, {match['center'][1]}). "
                     "Detection test did not click the map.",
                     success=True
@@ -1442,7 +1479,7 @@ class BTDGui:
             if down >= MAP_DETECTION_MAX_DOWN_NOTCHES:
                 score_text = f"{match['score']:.1%}" if match else "no match"
                 self._finish_map_detection_test(
-                    f"Could not confidently find {state['map_name']} (best score {score_text}). "
+                    f"Could not uniquely identify {state['map_name']} (best candidate {score_text}). "
                     "No map was clicked. Check the reference crop and whether the card is obscured.",
                     success=False
                 )
@@ -2578,7 +2615,8 @@ class BTDGui:
                 "Import a cropped map-art image in the Map Detection tab."
             )
         self._require_map_detection_libraries()
-        scroll_point = self._lobby_screen_point(hwnd, "MAP SCROLL AREA")
+        self._lobby_require_focus(hwnd)
+        scroll_point = self._map_detection_scroll_point(hwnd)
         win32api.SetCursorPos(scroll_point)
         self.append_log(
             f"Map detection for {map_name}: resetting the list with "
@@ -2626,14 +2664,15 @@ class BTDGui:
             self._lobby_move_to_detected_map(hwnd, map_name, screen_target)
             return
 
-        score_text = f"{match['score']:.3f}" if match is not None else "no match"
+        score_text = (f"{match['score']:.3f} (margin {match.get('margin', 0.0):.3f})"
+                      if match is not None else "no match")
         self.append_log(
             f"Map scan {down_notches + 1}: {map_name} confidence={score_text}."
         )
         if down_notches >= MAP_DETECTION_MAX_DOWN_NOTCHES:
             raise RuntimeError(
-                f"Could not confidently locate {map_name} after scanning the map list "
-                f"(best score: {score_text}). No map was clicked. Check its reference image."
+                f"Could not uniquely identify {map_name} after scanning the map list "
+                f"(best candidate: {score_text}). No map was clicked. Check its reference image."
             )
         win32api.SetCursorPos(scroll_point)
         win32api.mouse_event(0x0800, 0, 0, -120, 0)
