@@ -958,7 +958,7 @@ class BTDGui:
         )
 
     def test_roblox_focus_and_scroll(self) -> None:
-        """Focus Roblox, smoothly center the cursor, verify it, then scroll twice."""
+        """Focus Roblox, move to the saved map-list point, refresh hover, and scroll once."""
         if self._roblox_scroll_test_active:
             self.set_status("Roblox scroll test is already running.", "warning")
             return
