@@ -1152,6 +1152,34 @@ class BTDGui:
             )
         return self._lobby_screen_point(hwnd, "MAP SCROLL AREA")
 
+    def _validate_map_detection_scroll_record(self, hwnd: int) -> None:
+        """Check the saved scroll point was captured at approximately expanded size."""
+        record = self.button_positions.get("MAP SCROLL AREA")
+        if not isinstance(record, dict):
+            raise RuntimeError(
+                "MAP SCROLL AREA is missing. Capture it with F3 while Roblox is expanded."
+            )
+        metrics = self._get_roblox_client_metrics(hwnd)
+        saved_width = int(record.get("client_width", 0))
+        saved_height = int(record.get("client_height", 0))
+        expected_width = int(metrics["work_width"])
+        expected_height = int(metrics["work_height"])
+        # Allow window borders/title-bar differences while rejecting old docked-size points.
+        tolerance_x = max(48, int(expected_width * 0.12))
+        tolerance_y = max(48, int(expected_height * 0.12))
+        if (
+            saved_width <= 0 or saved_height <= 0
+            or abs(saved_width - expected_width) > tolerance_x
+            or abs(saved_height - expected_height) > tolerance_y
+        ):
+            raise RuntimeError(
+                "MAP SCROLL AREA was not captured at expanded Roblox size. "
+                f"Saved client={saved_width}x{saved_height}; monitor work area="
+                f"{expected_width}x{expected_height}. Open the map selector, arm F3, "
+                "expand Roblox in Map Detection, hover the map list, and press F3. "
+                "The lobby sequence was not started."
+            )
+
     def _update_map_detection_size(self, metrics: dict) -> None:
         self.map_detection_size_var.set(
             f"Roblox client: {metrics['client_width']} × {metrics['client_height']} px\n"
@@ -2353,6 +2381,7 @@ class BTDGui:
                 hwnd = self._find_roblox_window()
             if hwnd is None or not win32gui.IsWindow(hwnd):
                 raise RuntimeError("Roblox window not found. Open Roblox first.")
+            self._validate_map_detection_scroll_record(hwnd)
 
             self._lobby_sequence_active = True
             self._lobby_sequence_mode = mode
@@ -2663,8 +2692,8 @@ class BTDGui:
                 f"separation={match['margin']:.3f}, client_box={match['box']}."
             )
             self.set_status(
-                f"{map_name} detected ({match['score']:.0%}); selecting…"
-, "success"
+                f"{map_name} detected ({match['score']:.0%}); selecting…",
+                "success"
             )
             self._lobby_move_to_detected_map(hwnd, map_name, screen_target)
             return
