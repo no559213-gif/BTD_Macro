@@ -3156,6 +3156,10 @@ finally:
                 "BTD Macro because Roblox might still depend on the Macro window."
             )
 
+        # Hide before restoring the original extended style so the Shell can
+        # remove the docked taskbar button cleanly when the original style/owner
+        # combination is not taskbar-eligible.
+        win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
         win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, restored_style)
         win32gui.SetWindowLong(
             hwnd, win32con.GWL_EXSTYLE, int(state["ex_style"])
