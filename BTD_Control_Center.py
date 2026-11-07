@@ -32,8 +32,8 @@ from urllib.request import Request, urlopen
 
 
 APP_NAME = "BTD Control Center"
-APP_VERSION = "1.0.2"
-APP_RELEASE_NOTES = "Moved the High Angle camera anchor to 15 cm right of the Roblox client center; kept the vertical center, DPI-aware physical offset, and existing drag/zoom sequence."
+APP_VERSION = "1.0.3"
+APP_RELEASE_NOTES = "Changed High Angle positioning to move to the furthest safe point at the right edge of the Roblox client, then return 2 cm left at the same vertical center before the existing camera drag and zoom sequence."
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 
 # Familiar dark BTD Macro palette, independently defined for this application.
@@ -1558,7 +1558,7 @@ class BTDControlCenter:
             self._ui_call(self._finish_high_angle, succeeded, error)
 
     def _run_high_angle_sequence(self, hwnd: int, *, playback_mode: bool) -> bool:
-        """TDX camera movement, starting 15 cm right of the client-area center."""
+        """Anchor at the rightmost safe client point, then return 2 cm left."""
         if not win32gui or not win32gui.IsWindow(hwnd):
             raise RuntimeError("Roblox window is no longer available.")
         if playback_mode:
@@ -1578,12 +1578,17 @@ class BTDControlCenter:
             dpi = 96
         if dpi < 48 or dpi > 960:
             dpi = 96
-        right_offset_px = int(round((15.0 / 2.54) * dpi))
-        target_x = left + width // 2 + right_offset_px
+
+        # First identify the furthest point that remains inside the client area,
+        # then return 2 physical centimeters to the left. Keep the vertical
+        # anchor at the exact client-area midpoint.
+        retreat_px = int(round((2.0 / 2.54) * dpi))
+        safe_right_x = left + width - 1
+        target_x = safe_right_x - retreat_px
         target_y = top + height // 2
-        if target_x >= left + width:
+        if width <= retreat_px + 1:
             raise RuntimeError(
-                f"Roblox client is too narrow for a 15 cm rightward offset at {dpi} DPI."
+                f"Roblox client is too narrow to leave a 2 cm right-edge margin at {dpi} DPI."
             )
         if self._high_angle_cancel.is_set() or (playback_mode and self._playback_stop.is_set()):
             return False
