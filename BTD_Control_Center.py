@@ -32,8 +32,8 @@ from urllib.request import Request, urlopen
 
 
 APP_NAME = "BTD Control Center"
-APP_VERSION = "1.0.5"
-APP_RELEASE_NOTES = "Recording Library: select saved macros from a dropdown, Load or Delete them, refresh the list, and play the loaded macro with one click. Newly recorded macros are saved and loaded automatically. Added adjustable Cursor settle and Delay after click playback timings (500 ms defaults). High Angle eases to the furthest safe right point and returns 1 cm left at the same vertical center."
+APP_VERSION = "1.0.6"
+APP_RELEASE_NOTES = "Rebuilt Playback to follow the recorded event timeline without added pauses. Fixed right-click camera playback to move to the recorded drag-start point before holding the button, retained relative drag movement, and preserved full mouse-wheel deltas. Removed unrelated playback timing overrides; every recorded input now plays at its captured speed."
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 
 # Familiar dark BTD Macro palette, independently defined for this application.
@@ -582,7 +582,9 @@ class WindowsInputCapture:
                                             self._enqueue("buttonUp", button, release_point[0], release_point[1])
                                 elif msg in (self.WM_MOUSEWHEEL, self.WM_MOUSEHWHEEL) and enabled and point is not None and self._is_target_foreground():
                                     signed_delta = ctypes.c_short((int(info.mouseData) >> 16) & 0xFFFF).value
-                                    amount = max(1, min(120, abs(int(signed_delta))))
+                                    amount = abs(int(signed_delta))
+                                    if amount <= 0:
+                                        return user32.CallNextHookEx(self._mouse_hook, code, wparam, lparam)
                                     if msg == self.WM_MOUSEWHEEL:
                                         direction = "WheelUp" if signed_delta > 0 else "WheelDown"
                                     else:
@@ -673,9 +675,6 @@ class BTDControlCenter:
         self._loaded_recording_path: Path | None = None
         self._loaded_recording_actions: list[dict] = []
         self._recording_paths_by_name: dict[str, Path] = {}
-        self._mouse_timing_file = self.recordings_dir / ".mouse_timing.json"
-        self.cursor_settle_var = tk.StringVar(value="500")
-        self.delay_after_click_var = tk.StringVar(value="500")
         self._recording_countdown_id = None
         self._runtime_poll_id = None
         self._playback_active = False
@@ -696,7 +695,6 @@ class BTDControlCenter:
 
         self._configure_styles()
         self._build_layout()
-        self._load_mouse_timing_settings()
         self._refresh_recording_library(restore_last=True)
         self.root.protocol("WM_DELETE_WINDOW", self.close_app)
         self.game_host.bind("<Configure>", self._on_game_host_configure, add="+")
@@ -929,34 +927,6 @@ class BTDControlCenter:
             manager, textvariable=self.loaded_recording_var, bg=PANEL, fg=MUTED,
             anchor="w", font=("Segoe UI", 8),
         ).grid(row=2, column=0, columnspan=4, sticky="ew", padx=10, pady=(0, 8))
-        timing_row = tk.Frame(manager, bg=PANEL_ALT)
-        timing_row.grid(row=3, column=0, columnspan=4, sticky="ew", padx=8, pady=(0, 8))
-        timing_row.grid_columnconfigure(1, weight=1)
-        timing_row.grid_columnconfigure(3, weight=1)
-        tk.Label(
-            timing_row, text="Cursor settle (ms)", bg=PANEL_ALT, fg=MUTED,
-            font=("Segoe UI", 8),
-        ).grid(row=0, column=0, sticky="w", padx=(6, 4), pady=6)
-        self.cursor_settle_entry = tk.Entry(
-            timing_row, textvariable=self.cursor_settle_var, width=6,
-            bg=BG, fg=TEXT, insertbackground=TEXT, relief="flat",
-            highlightthickness=1, highlightbackground=BORDER,
-            font=("Segoe UI", 8), justify="center",
-        )
-        self.cursor_settle_entry.grid(row=0, column=1, sticky="w", padx=(0, 12), pady=5)
-        tk.Label(
-            timing_row, text="Delay after click (ms)", bg=PANEL_ALT, fg=MUTED,
-            font=("Segoe UI", 8),
-        ).grid(row=0, column=2, sticky="w", padx=(0, 4), pady=6)
-        self.delay_after_click_entry = tk.Entry(
-            timing_row, textvariable=self.delay_after_click_var, width=6,
-            bg=BG, fg=TEXT, insertbackground=TEXT, relief="flat",
-            highlightthickness=1, highlightbackground=BORDER,
-            font=("Segoe UI", 8), justify="center",
-        )
-        self.delay_after_click_entry.grid(row=0, column=3, sticky="w", padx=(0, 6), pady=5)
-        self.cursor_settle_entry.bind("<FocusOut>", self._save_mouse_timing_settings)
-        self.delay_after_click_entry.bind("<FocusOut>", self._save_mouse_timing_settings)
 
     # ------------------------------------------------------------------
     # Recording, playback, and High Angle. Auto Position remains intentionally on hold.
@@ -1248,7 +1218,7 @@ class BTDControlCenter:
             for action in self._recording_actions:
                 writer.writerow((
                     action["type"], action["value"], action["x"], action["y"],
-                    f"{action['delay']:.3f}",
+                    f"{action['delay']:.6f}",
                 ))
         return output_path
 
@@ -1388,58 +1358,6 @@ class BTDControlCenter:
         self.set_status(f"Deleted recording: {path.name}.", "success")
         self.append_log(f"Deleted recording: {path.name}.")
 
-    def _load_mouse_timing_settings(self) -> None:
-        try:
-            data = json.loads(self._mouse_timing_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            return
-        for key, variable in (
-            ("cursor_settle_ms", self.cursor_settle_var),
-            ("delay_after_click_ms", self.delay_after_click_var),
-        ):
-            try:
-                value = max(0, min(10000, int(data.get(key, 500))))
-            except (TypeError, ValueError, OverflowError):
-                value = 500
-            variable.set(str(value))
-
-    def _save_mouse_timing_settings(self, _event=None) -> None:
-        values = {}
-        for key, variable in (
-            ("cursor_settle_ms", self.cursor_settle_var),
-            ("delay_after_click_ms", self.delay_after_click_var),
-        ):
-            raw = variable.get().strip()
-            try:
-                value = int(raw)
-            except (TypeError, ValueError, OverflowError):
-                value = 500
-            value = max(0, min(10000, value))
-            variable.set(str(value))
-            values[key] = value
-        try:
-            temp = self._mouse_timing_file.with_suffix(".tmp")
-            temp.write_text(json.dumps(values, indent=2), encoding="utf-8")
-            temp.replace(self._mouse_timing_file)
-        except OSError as exc:
-            self.append_log(f"Could not save mouse timing preferences: {exc}")
-
-    def _get_mouse_timing_values(self) -> tuple[int, int]:
-        values = []
-        for variable, label in (
-            (self.cursor_settle_var, "Cursor settle"),
-            (self.delay_after_click_var, "Delay after click"),
-        ):
-            try:
-                value = int(variable.get().strip())
-            except (TypeError, ValueError, OverflowError):
-                raise ValueError(f"{label} must be a whole number from 0 to 10000 ms.")
-            if value < 0 or value > 10000:
-                raise ValueError(f"{label} must be between 0 and 10000 ms.")
-            values.append(value)
-        self._save_mouse_timing_settings()
-        return values[0], values[1]
-
     def on_playback(self) -> None:
         if self._playback_active:
             self.stop_playback()
@@ -1461,12 +1379,6 @@ class BTDControlCenter:
             self._update_loaded_recording_label()
             self.set_status("The loaded recording file is missing. Select and load it again.", "error")
             return
-        try:
-            cursor_settle_ms, delay_after_click_ms = self._get_mouse_timing_values()
-        except ValueError as exc:
-            self.set_status(str(exc), "error")
-            messagebox.showwarning("Mouse timing", str(exc), parent=self.root)
-            return
         if not self._ensure_roblox_focus(self.docked_hwnd, 3000):
             self.set_status("Playback cancelled: Roblox focus could not be confirmed.", "error")
             return
@@ -1482,7 +1394,7 @@ class BTDControlCenter:
         self.append_log(f"Playback started from loaded recording {path.name}; action count={len(actions)}.")
         self._playback_thread = threading.Thread(
             target=self._playback_worker,
-            args=(self.docked_hwnd, actions, path, cursor_settle_ms, delay_after_click_ms),
+            args=(self.docked_hwnd, actions, path),
             name="BTDPlayback",
             daemon=True,
         )
@@ -1662,9 +1574,7 @@ class BTDControlCenter:
         if not user32.SetCursorPos(px, py):
             raise ctypes.WinError(ctypes.get_last_error())
 
-    def _playback_action(
-        self, hwnd: int, action: dict, *, cursor_settle_ms: int = 0
-    ) -> None:
+    def _playback_action(self, hwnd: int, action: dict) -> None:
         kind, value = action["type"], action["value"]
         x, y = action["x"], action["y"]
         if kind == "wait":
@@ -1680,12 +1590,12 @@ class BTDControlCenter:
         elif kind == "moveRel":
             self._send_mouse_input(dx=x, dy=y, flags=0x0001)  # MOUSEEVENTF_MOVE
         elif kind in ("buttonDown", "buttonUp"):
-            if value != "Right":
+            # Every button-down starts from its recorded client coordinate,
+            # including right-click camera drags. Keep the drag itself relative.
+            # For a right-button release, leave the cursor where the relative
+            # drag naturally ended instead of snapping it to a screen coordinate.
+            if value != "Right" or kind == "buttonDown":
                 self._move_playback_cursor(hwnd, x, y)
-                if kind == "buttonDown" and cursor_settle_ms > 0:
-                    time.sleep(cursor_settle_ms / 1000.0)
-                    if self._playback_stop.is_set() or not self._playback_focus(hwnd):
-                        raise RuntimeError("Playback stopped while waiting for the cursor to settle.")
             down = kind == "buttonDown"
             self._send_mouse_button(value, down)
             if down:
@@ -1701,12 +1611,8 @@ class BTDControlCenter:
                 self._playback_held_keys.discard(value)
         elif kind == "wheel":
             self._move_playback_cursor(hwnd, x, y)
-            if cursor_settle_ms > 0:
-                time.sleep(cursor_settle_ms / 1000.0)
-                if self._playback_stop.is_set() or not self._playback_focus(hwnd):
-                    raise RuntimeError("Playback stopped while waiting for the cursor to settle before scrolling.")
             direction, _, amount_text = value.partition("@")
-            amount = max(1, min(120, abs(int(amount_text or "120"))))
+            amount = max(1, abs(int(amount_text or "120")))
             if direction == "WheelUp":
                 self._send_mouse_input(flags=0x0800, data=amount)
             elif direction == "WheelDown":
@@ -1737,10 +1643,7 @@ class BTDControlCenter:
         self._playback_held_keys.clear()
         self._playback_held_buttons.clear()
 
-    def _playback_worker(
-        self, hwnd: int, actions: list[dict], path: Path,
-        cursor_settle_ms: int = 500, delay_after_click_ms: int = 500,
-    ) -> None:
+    def _playback_worker(self, hwnd: int, actions: list[dict], path: Path) -> None:
         started = time.perf_counter()
         timeline_ms = 0.0
         error = ""
@@ -1761,24 +1664,7 @@ class BTDControlCenter:
                     self._release_playback_inputs(hwnd)
                 if self._playback_stop.is_set():
                     break
-                self._playback_action(hwnd, action, cursor_settle_ms=cursor_settle_ms)
-                extra_delay_ms = 0
-                if action.get("type") == "buttonUp" and delay_after_click_ms > 0:
-                    remaining = delay_after_click_ms / 1000.0
-                    while remaining > 0 and not self._playback_stop.is_set():
-                        if not self._playback_focus(hwnd):
-                            raise RuntimeError("Roblox lost focus during the post-click delay.")
-                        interval = min(0.025, remaining)
-                        time.sleep(interval)
-                        remaining -= interval
-                    if self._playback_stop.is_set():
-                        break
-                    extra_delay_ms += delay_after_click_ms
-                if action.get("type") == "buttonDown" and action.get("value") != "Right":
-                    extra_delay_ms += cursor_settle_ms
-                elif action.get("type") == "wheel":
-                    extra_delay_ms += cursor_settle_ms
-                started += extra_delay_ms / 1000.0
+                self._playback_action(hwnd, action)
                 if index % 100 == 0:
                     self._ui_status(f"Playback in progress: {index}/{len(actions)} actions.", "progress")
         except Exception as exc:
