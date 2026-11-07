@@ -32,8 +32,8 @@ from urllib.request import Request, urlopen
 
 
 APP_NAME = "BTD Control Center"
-APP_VERSION = "1.0.1"
-APP_RELEASE_NOTES = "Added a GitHub updater with release notes, SHA-256 verification, timestamped backups, and rollback if the installer cannot relaunch the app."
+APP_VERSION = "1.0.2"
+APP_RELEASE_NOTES = "Moved the High Angle camera anchor to 15 cm right of the Roblox client center; kept the vertical center, DPI-aware physical offset, and existing drag/zoom sequence."
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 
 # Familiar dark BTD Macro palette, independently defined for this application.
@@ -1537,8 +1537,8 @@ class BTDControlCenter:
         self._high_angle_running = True
         self.high_angle_button.configure(text="STOP HIGH ANGLE", bg=DANGER, fg="#FFFFFF")
         self._input_capture.set_high_angle(True)
-        self.set_status("Applying High Angle from 3 cm right of the Roblox center...", "progress")
-        self.append_log("High Angle started at the center-right camera anchor (3 cm offset).")
+        self.set_status("Applying High Angle from 15 cm right of the Roblox center...", "progress")
+        self.append_log("High Angle started at the center-right camera anchor (15 cm offset).")
         self._high_angle_thread = threading.Thread(
             target=self._high_angle_worker,
             args=(self.docked_hwnd,),
@@ -1558,7 +1558,7 @@ class BTDControlCenter:
             self._ui_call(self._finish_high_angle, succeeded, error)
 
     def _run_high_angle_sequence(self, hwnd: int, *, playback_mode: bool) -> bool:
-        """TDX camera movement, starting 3 cm right of the client-area center."""
+        """TDX camera movement, starting 15 cm right of the client-area center."""
         if not win32gui or not win32gui.IsWindow(hwnd):
             raise RuntimeError("Roblox window is no longer available.")
         if playback_mode:
@@ -1578,12 +1578,12 @@ class BTDControlCenter:
             dpi = 96
         if dpi < 48 or dpi > 960:
             dpi = 96
-        right_offset_px = int(round((3.0 / 2.54) * dpi))
+        right_offset_px = int(round((15.0 / 2.54) * dpi))
         target_x = left + width // 2 + right_offset_px
         target_y = top + height // 2
         if target_x >= left + width:
             raise RuntimeError(
-                f"Roblox client is too narrow for a 3 cm rightward offset at {dpi} DPI."
+                f"Roblox client is too narrow for a 15 cm rightward offset at {dpi} DPI."
             )
         if self._high_angle_cancel.is_set() or (playback_mode and self._playback_stop.is_set()):
             return False
@@ -1662,7 +1662,7 @@ class BTDControlCenter:
             self.set_status(f"High Angle failed: {error}", "error")
             self.append_log(f"High Angle failed: {error}")
         elif succeeded:
-            self.set_status("High Angle completed (3 cm rightward anchor).", "success")
+            self.set_status("High Angle completed (15 cm rightward anchor).", "success")
             self.append_log("High Angle finished: right-drag and 15 zoom-out notches completed.")
         else:
             self.set_status("High Angle stopped.", "warning")
