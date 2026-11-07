@@ -1510,7 +1510,7 @@ class BTDGui:
             )
 
         roblox_rect = (work_left, work_top, roblox_right, work_bottom)
-        mini_left = roblox_right + gap
+        mini_left = roblox_right
         mini_top = work_top + gap
         mini_rect = (
             mini_left, mini_top,
