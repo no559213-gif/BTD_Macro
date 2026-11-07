@@ -1,12 +1,13 @@
 """Standalone BTD High Angle mini-GUI.
 
-Windows-only. Exactly one visible control: HIGH ANGLE.
-F9 is registered as a global hotkey. This app does not import or update any
-other BTD application.
+Windows-only single-purpose mini-GUI with one High Angle button, an optional
+Always on Top setting, and a global F9 hotkey. It does not import or update
+any other BTD application.
 """
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import queue
 import subprocess
@@ -15,6 +16,7 @@ import threading
 import time
 import tkinter as tk
 from ctypes import wintypes
+from pathlib import Path
 
 APP_NAME = "BTD High Angle"
 HOTKEY_ID = 1
@@ -29,8 +31,8 @@ if os.name != "nt":
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
-# DPI-aware coordinates keep the 1 cm inset accurate at Windows scaling other
-# than 100% (including the 125% scaling used on many laptop displays).
+# DPI-aware coordinates keep the 4 cm edge inset accurate at Windows scaling
+# other than 100% (including 125% scaling).
 try:
     _set_dpi = user32.SetProcessDpiAwarenessContext
     _set_dpi.argtypes = [ctypes.c_void_p]
@@ -270,9 +272,12 @@ class HighAngleApp:
         self.root.title(APP_NAME)
         self.root.configure(bg="#11141B")
         self.root.resizable(False, False)
-        self.root.geometry("206x76")
-        self.root.minsize(206, 76)
-        self.root.maxsize(206, 76)
+        self.root.geometry("206x106")
+        self.root.minsize(206, 106)
+        self.root.maxsize(206, 106)
+
+        self.settings_path = self._get_settings_path()
+        self.topmost_var = tk.BooleanVar(value=self._load_topmost_setting())
 
         self.cancel = threading.Event()
         self.running = False
@@ -296,7 +301,26 @@ class HighAngleApp:
             cursor="hand2",
             takefocus=True,
         )
-        self.button.pack(fill="both", expand=True, padx=9, pady=9)
+        self.button.pack(fill="both", expand=True, padx=9, pady=(9, 3))
+
+        self.topmost_check = tk.Checkbutton(
+            self.root,
+            text="Always on top",
+            variable=self.topmost_var,
+            command=self._on_topmost_changed,
+            bg="#11141B",
+            fg="#E8ECF4",
+            activebackground="#11141B",
+            activeforeground="#FFFFFF",
+            selectcolor="#202735",
+            bd=0,
+            highlightthickness=0,
+            font=("Segoe UI", 9),
+            cursor="hand2",
+            anchor="w",
+        )
+        self.topmost_check.pack(fill="x", padx=11, pady=(0, 7))
+        self.root.attributes("-topmost", bool(self.topmost_var.get()))
 
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(50, self._poll_hotkey_queue)
@@ -305,6 +329,36 @@ class HighAngleApp:
         )
         self.hotkey_thread.start()
         self.root.after(1500, self._check_hotkey_startup)
+
+    @staticmethod
+    def _get_settings_path() -> Path:
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+        return base / "BTD_High_Angle" / "settings.json"
+
+    def _load_topmost_setting(self) -> bool:
+        try:
+            data = json.loads(self.settings_path.read_text(encoding="utf-8"))
+            return bool(data.get("always_on_top", False))
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+
+    def _on_topmost_changed(self) -> None:
+        enabled = bool(self.topmost_var.get())
+        self.root.attributes("-topmost", enabled)
+        try:
+            self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+            self.settings_path.write_text(
+                json.dumps({"always_on_top": enabled}, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            from tkinter import messagebox
+            messagebox.showwarning(
+                APP_NAME,
+                f"The topmost setting changed, but could not be saved:\\n{exc}",
+                parent=self.root,
+            )
 
     def _hotkey_loop(self) -> None:
         self.hotkey_thread_id = int(kernel32.GetCurrentThreadId())
@@ -421,11 +475,13 @@ class HighAngleApp:
             right_down = True
             try:
                 time.sleep(0.100)
-                for _ in range(50):
+                # Preserve the full 1,000 px downward camera drag, but
+                # spread it over ~1.8 s instead of the previous ~0.4 s.
+                for _ in range(100):
                     if not check_active():
                         return
-                    send_mouse(dx=0, dy=20, flags=0x0001)  # MOUSEEVENTF_MOVE (relative)
-                    time.sleep(0.008)
+                    send_mouse(dx=0, dy=10, flags=0x0001)  # MOUSEEVENTF_MOVE (relative)
+                    time.sleep(0.018)
                 time.sleep(0.120)
             finally:
                 # Always release the injected right button, even on cancellation/error.
