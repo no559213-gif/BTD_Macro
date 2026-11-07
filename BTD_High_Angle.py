@@ -9,6 +9,8 @@ from __future__ import annotations
 import ctypes
 import os
 import queue
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -360,13 +362,13 @@ class HighAngleApp:
             if not ensure_roblox_focus(hwnd):
                 raise RuntimeError("Could not bring Roblox Player into focus.")
             left, top, width, height, dpi = client_geometry(hwnd)
-            retreat_px = max(1, int(round((1.0 / 2.54) * dpi)))
+            retreat_px = max(1, int(round((2.0 / 2.54) * dpi)))
             safe_right_x = left + width - 1
             target_x = safe_right_x - retreat_px
             center_x = left + width // 2
             target_y = top + height // 2
             if width <= retreat_px + 1:
-                raise RuntimeError("Roblox client is too narrow for the 1 cm right-edge inset.")
+                raise RuntimeError("Roblox client is too narrow for the 2 cm right-edge inset.")
 
             def check_active() -> bool:
                 if self.cancel.is_set():
@@ -417,12 +419,7 @@ class HighAngleApp:
                     send_mouse(flags=0x0010)  # MOUSEEVENTF_RIGHTUP
                     right_down = False
 
-            for _ in range(15):
-                if not check_active():
-                    return
-                send_mouse(flags=0x0800, data=-120)  # one wheel notch down
-                time.sleep(0.045)
-            succeeded = True
+            # High Angle intentionally ends after the camera drag; no zoom input.\n            succeeded = True
         except Exception as exc:
             error = str(exc)
         finally:
@@ -454,5 +451,31 @@ class HighAngleApp:
         self.root.mainloop()
 
 
+def _relaunch_without_console() -> bool:
+    """Reopen through pythonw.exe so double-clicking the .py never shows CMD."""
+    try:
+        current = os.path.basename(sys.executable).casefold()
+        if current == "pythonw.exe":
+            return False
+        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        if not os.path.isfile(pythonw):
+            return False
+        env = os.environ.copy()
+        env["BTD_HIGH_ANGLE_NO_CONSOLE"] = "1"
+        subprocess.Popen(
+            [pythonw, os.path.abspath(__file__), *sys.argv[1:]],
+            env=env,
+            close_fds=True,
+            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0x00000008),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
-    HighAngleApp().run()
+    if not _relaunch_without_console():
+        HighAngleApp().run()
