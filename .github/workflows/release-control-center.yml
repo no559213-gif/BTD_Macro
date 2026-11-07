@@ -61,7 +61,7 @@ jobs:
           source = Path('BTD_Control_Center.py')
           digest = hashlib.sha256(source.read_bytes()).hexdigest()
           Path('BTD_Control_Center.py.sha256').write_text(
-              f"{digest}  BTD_Control_Center.py\\n", encoding='ascii'
+              f"{digest}  BTD_Control_Center.py", encoding='ascii'
           )
 
           tree = ast.parse(source.read_text(encoding='utf-8'))
@@ -73,12 +73,7 @@ jobs:
               ):
                   notes = ast.literal_eval(node.value)
                   break
-          Path('RELEASE_NOTES.md').write_text(notes + '\\n', encoding='utf-8')
+          Path('RELEASE_NOTES.md').write_text(notes, encoding='utf-8')
           PY
 
-          gh release create "$TAG" \\
-            BTD_Control_Center.py \\
-            BTD_Control_Center.py.sha256 \\
-            --target "$GITHUB_SHA" \\
-            --title "BTD Control Center ${{ steps.app.outputs.version }}" \\
-            --notes-file RELEASE_NOTES.md
+          gh release create "$TAG" BTD_Control_Center.py BTD_Control_Center.py.sha256 --target "$GITHUB_SHA" --title "BTD Control Center ${{ steps.app.outputs.version }}" --notes-file RELEASE_NOTES.md
