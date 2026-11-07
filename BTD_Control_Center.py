@@ -33,7 +33,7 @@ from urllib.request import Request, urlopen
 
 APP_NAME = "BTD Control Center"
 APP_VERSION = "1.0.1"
-APP_RELEASE_NOTES = "Added GitHub auto-update checks, release notes, SHA-256 verification, timestamped backups, and startup-confirmed rollback."
+APP_RELEASE_NOTES = "Added a GitHub updater with release notes, SHA-256 verification, timestamped backups, and rollback if the installer cannot relaunch the app."
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 
 # Familiar dark BTD Macro palette, independently defined for this application.
@@ -63,7 +63,8 @@ except ImportError:
     PYWIN32_AVAILABLE = False
 
 
-# Dedicated tag namespace: Control Center never consumes BTD Macro releases.
+# Control Center releases use their own tag prefix so this app never mistakes
+# an older BTD Macro release for a Control Center update.
 UPDATE_REPOSITORY = "no559213-gif/BTD_Macro"
 UPDATE_TAG_PREFIX = "control-center-v"
 UPDATE_ASSET_NAME = "BTD_Control_Center.py"
@@ -71,99 +72,123 @@ UPDATE_CHECKSUM_ASSET_NAME = "BTD_Control_Center.py.sha256"
 UPDATE_MAX_BYTES = 5 * 1024 * 1024
 
 
-def _version_tuple(value: str) -> tuple[int, int, int] | None:
+def _version_tuple(value: str) -> tuple[int, ...] | None:
+    """Parse a simple numeric version such as 1.2.3 for safe comparisons."""
     match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", str(value).strip())
-    return tuple(int(part) for part in match.groups()) if match else None
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
 
 
-def _read_github_url(url: str, max_bytes: int, accept: str = "application/octet-stream") -> bytes:
-    allowed = {"api.github.com", "github.com", "release-assets.githubusercontent.com"}
+def _read_github_url(url: str, max_bytes: int, *, accept: str = "application/octet-stream") -> bytes:
+    """Read a bounded HTTPS response from GitHub, including its asset CDN."""
     parsed = urlparse(url)
-    if parsed.scheme != "https" or parsed.hostname not in allowed:
-        raise ValueError("Untrusted update URL.")
-    request = Request(url, headers={
-        "User-Agent": "BTD-Control-Center-Updater",
-        "Accept": accept,
-        "X-GitHub-Api-Version": "2022-11-28",
-    })
+    if parsed.scheme != "https" or parsed.hostname not in {
+        "api.github.com", "github.com", "release-assets.githubusercontent.com"
+    }:
+        raise ValueError("The update server returned an untrusted download URL.")
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "BTD-Control-Center-Updater",
+            "Accept": accept,
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
     with urlopen(request, timeout=20) as response:
-        if urlparse(response.geturl()).hostname not in allowed:
-            raise ValueError("GitHub redirected to an untrusted host.")
+        final_host = urlparse(response.geturl()).hostname
+        if final_host not in {"api.github.com", "github.com", "release-assets.githubusercontent.com"}:
+            raise ValueError("GitHub redirected the update request to an untrusted host.")
         payload = response.read(max_bytes + 1)
     if len(payload) > max_bytes:
-        raise ValueError("Update download exceeds the size limit.")
+        raise ValueError("The update download is larger than the allowed size.")
     return payload
 
 
 def _find_latest_control_center_release() -> dict | None:
-    tags_url = (f"https://api.github.com/repos/{UPDATE_REPOSITORY}"
-                f"/git/matching-refs/tags/{UPDATE_TAG_PREFIX}")
-    refs = json.loads(_read_github_url(
-        tags_url, 2 * 1024 * 1024, "application/vnd.github+json"
-    ).decode("utf-8"))
+    """Find the latest stable Control Center release using its dedicated tag prefix."""
+    tags_url = (
+        f"https://api.github.com/repos/{UPDATE_REPOSITORY}"
+        f"/git/matching-refs/tags/{UPDATE_TAG_PREFIX}"
+    )
+    payload = _read_github_url(tags_url, 2 * 1024 * 1024, accept="application/vnd.github+json")
+    refs = json.loads(payload.decode("utf-8"))
     versions = []
     for item in refs if isinstance(refs, list) else []:
-        tag = str(item.get("ref", "")).rsplit("/", 1)[-1]
-        if tag.startswith(UPDATE_TAG_PREFIX):
-            version = tag[len(UPDATE_TAG_PREFIX):]
-            parsed = _version_tuple(version)
-            if parsed is not None:
-                versions.append((parsed, tag, version))
+        ref = str(item.get("ref", ""))
+        tag = ref.rsplit("/", 1)[-1]
+        if not tag.startswith(UPDATE_TAG_PREFIX):
+            continue
+        version = tag[len(UPDATE_TAG_PREFIX):]
+        parsed_version = _version_tuple(version)
+        if parsed_version is not None:
+            versions.append((parsed_version, tag, version))
+
+    # Fetch only matching Control Center releases; unrelated BTD Macro release
+    # tags do not affect discovery, even after the repository has hundreds of them.
     for _parsed, tag, version in sorted(versions, reverse=True):
-        release_url = (f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/tags/"
-                       f"{quote(tag, safe='')}")
+        release_url = (
+            f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/tags/"
+            f"{quote(tag, safe='')}"
+        )
         try:
-            data = _read_github_url(release_url, 512 * 1024, "application/vnd.github+json")
+            raw = _read_github_url(release_url, 512 * 1024, accept="application/vnd.github+json")
         except HTTPError as exc:
             if exc.code == 404:
-                continue
+                continue  # Tag exists but its release may still be publishing.
             raise
-        release = json.loads(data.decode("utf-8"))
+        release = json.loads(raw.decode("utf-8"))
         if release.get("draft") or release.get("prerelease"):
             continue
-        assets = {str(a.get("name", "")): a for a in release.get("assets", [])}
-        script = assets.get(UPDATE_ASSET_NAME)
-        checksum = assets.get(UPDATE_CHECKSUM_ASSET_NAME)
-        if script and checksum:
-            return {
-                "version": version, "tag": tag,
-                "notes": str(release.get("body", "")).strip(),
-                "script_url": script.get("browser_download_url"),
-                "checksum_url": checksum.get("browser_download_url"),
-                "digest": str(script.get("digest", "") or ""),
-            }
+        assets = {str(item.get("name", "")): item for item in release.get("assets", [])}
+        script_asset = assets.get(UPDATE_ASSET_NAME)
+        checksum_asset = assets.get(UPDATE_CHECKSUM_ASSET_NAME)
+        if not script_asset or not checksum_asset:
+            continue
+        return {
+            "version": version,
+            "tag": tag,
+            "notes": str(release.get("body", "")).strip(),
+            "script_url": script_asset.get("browser_download_url"),
+            "checksum_url": checksum_asset.get("browser_download_url"),
+            "digest": str(script_asset.get("digest", "") or ""),
+        }
     return None
 
 
 def _download_and_validate_update(release: dict, current_version: str, app_path: Path) -> Path:
-    urls = (str(release.get("script_url", "")), str(release.get("checksum_url", "")))
-    asset_prefix = f"/{UPDATE_REPOSITORY}/releases/download/"
-    for url in urls:
-        parsed = urlparse(url)
-        if parsed.scheme != "https" or parsed.hostname != "github.com" or not parsed.path.startswith(asset_prefix):
-            raise ValueError("Unexpected GitHub release asset URL.")
-    payload = _read_github_url(urls[0], UPDATE_MAX_BYTES)
-    checksum_text = _read_github_url(urls[1], 4096).decode("ascii", errors="replace").strip()
+    """Download, checksum-verify, syntax-check, and stage an update beside the app."""
+    source_url = str(release.get("script_url", ""))
+    checksum_url = str(release.get("checksum_url", ""))
+    for asset_url in (source_url, checksum_url):
+        parsed_url = urlparse(asset_url)
+        if (parsed_url.scheme != "https" or parsed_url.hostname != "github.com"
+                or not parsed_url.path.startswith(f"/{UPDATE_REPOSITORY}/releases/download/")):
+            raise ValueError("The release contains an unexpected asset download URL.")
+    source = _read_github_url(source_url, UPDATE_MAX_BYTES)
+    checksum_text = _read_github_url(checksum_url, 4096).decode("utf-8", errors="replace").strip()
     expected = checksum_text.split()[0].lower() if checksum_text else ""
     if not re.fullmatch(r"[0-9a-f]{64}", expected):
-        raise ValueError("Missing or invalid SHA-256 checksum.")
-    actual = hashlib.sha256(payload).hexdigest()
+        raise ValueError("The release did not provide a valid SHA-256 checksum.")
+    actual = hashlib.sha256(source).hexdigest()
     if not hmac.compare_digest(actual, expected):
-        raise ValueError("Downloaded update failed SHA-256 verification.")
-    digest = str(release.get("digest", "") or "")
-    if digest.startswith("sha256:") and not hmac.compare_digest(actual, digest.split(":", 1)[1].lower()):
-        raise ValueError("Checksum does not match GitHub's asset digest.")
-    source_text = payload.decode("utf-8")
-    match = re.search(r"""^APP_VERSION\s*=\s*["']([^"']+)["']""", source_text, re.MULTILINE)
-    if not match or match.group(1) != str(release.get("version", "")):
-        raise ValueError("Downloaded app version does not match the release tag.")
-    new_version = _version_tuple(match.group(1))
+        raise ValueError("The downloaded update failed its SHA-256 integrity check.")
+    asset_digest = str(release.get("digest", "") or "")
+    if asset_digest.startswith("sha256:") and not hmac.compare_digest(actual, asset_digest.split(":", 1)[1].lower()):
+        raise ValueError("The update checksum did not match GitHub's release asset digest.")
+
+    text = source.decode("utf-8")
+    version_match = re.search(r'^APP_VERSION\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+    if not version_match or version_match.group(1) != str(release.get("version", "")):
+        raise ValueError("The downloaded file version does not match the GitHub release.")
+    new_version = _version_tuple(version_match.group(1))
     old_version = _version_tuple(current_version)
     if new_version is None or old_version is None or new_version <= old_version:
-        raise ValueError("Downloaded version is not newer than the installed version.")
-    compile(source_text, str(app_path), "exec")
+        raise ValueError("The downloaded version is not newer than the installed version.")
+    compile(text, str(app_path), "exec")
+
     staged = app_path.with_name(app_path.name + ".download")
-    staged.write_bytes(payload)
+    staged.write_bytes(source)
     return staged
 
 
@@ -676,6 +701,7 @@ class BTDControlCenter:
         self.set_status("Idle — ready.", "idle")
         self.root.after_idle(self._maximize_and_lock_window)
         self.root.after_idle(self._install_raw_input_receiver)
+        # Network work runs on a worker so app startup and the GUI never freeze.
         self.root.after(2200, self._start_update_check)
 
     # ------------------------------------------------------------------
@@ -1114,7 +1140,8 @@ class BTDControlCenter:
 
     def _save_recording(self) -> Path | None:
         if not self._recording_actions:
-            return None        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            return None
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = self.recordings_dir / f"BTD_Recording_{stamp}.tsv"
         serial = 2
         while output_path.exists():
@@ -1814,7 +1841,7 @@ class BTDControlCenter:
         self._input_capture.record_raw_mouse_delta(int(raw.mouse.lLastX), int(raw.mouse.lLastY))
 
     # ------------------------------------------------------------------
-    # GitHub updater: separate Control Center tag feed.
+    # GitHub updater. Control Center releases are isolated from BTD Macro.
     # ------------------------------------------------------------------
     def _start_update_check(self) -> None:
         if self._update_check_thread and self._update_check_thread.is_alive():
@@ -1833,30 +1860,30 @@ class BTDControlCenter:
             if release and current and latest and latest > current:
                 self._ui_call(self._prompt_update, release)
             else:
-                self._ui_call(
-                    self._update_check_finished,
-                    bool(release and current and latest and latest == current),
-                )
+                self._ui_call(self._update_check_finished, bool(release))
         except Exception as exc:
             self._ui_call(self._update_check_failed, str(exc))
 
-    def _update_check_finished(self, is_current: bool) -> None:
-        self.append_log(
-            f"Control Center is up to date ({APP_VERSION})."
-            if is_current else "No newer Control Center release is available."
-        )
+    def _update_check_finished(self, found_release: bool) -> None:
+        if found_release:
+            self.append_log(f"Control Center is up to date ({APP_VERSION}).")
+        else:
+            self.append_log("No published Control Center update was found.")
 
     def _update_check_failed(self, error: str) -> None:
+        # A failed network check is non-fatal; the app remains fully usable offline.
         self.append_log(f"Update check unavailable: {error}")
 
     def _prompt_update(self, release: dict) -> None:
         if self._update_installing:
             return
-        notes = str(release.get("notes") or "No release notes provided.").strip()[:1800]
+        notes = release.get("notes") or "No release notes were provided."
+        notes = str(notes).strip()[:1800]
         prompt = (
             f"A new BTD Control Center version is available.\n\n"
             f"Installed: {APP_VERSION}\nAvailable: {release['version']}\n\n"
-            f"Release notes:\n{notes}\n\nDownload and install this update now?"
+            f"Release notes:\n{notes}\n\n"
+            "Download and install this update now?"
         )
         self.append_log(f"Update available: {release['version']}.")
         if not messagebox.askyesno("BTD Control Center update", prompt, parent=self.root):
@@ -1865,15 +1892,15 @@ class BTDControlCenter:
         if self._recording_active or self._recording_pending or self._playback_active or self._high_angle_running:
             messagebox.showwarning(
                 "Finish current action first",
-                "Update paused because Recording, Playback, or High Angle is active. "
-                "Stop the action and restart the app to check again.",
+                "The update was not started because Recording, Playback, or High Angle is active. "
+                "Stop the current action and restart the app to check again.",
                 parent=self.root,
             )
             return
         if getattr(sys, "frozen", False):
             messagebox.showinfo(
                 "Manual update required",
-                "The updater currently supports the Python .py build. Packaged executable updates must be installed manually.",
+                "This updater currently updates the Python .py build. Packaged executable updates must be installed manually.",
                 parent=self.root,
             )
             return
@@ -1888,7 +1915,8 @@ class BTDControlCenter:
 
     def _update_download_worker(self, release: dict) -> None:
         try:
-            staged = _download_and_validate_update(release, APP_VERSION, Path(__file__).resolve())
+            app_path = Path(__file__).resolve()
+            staged = _download_and_validate_update(release, APP_VERSION, app_path)
             self._ui_call(self._install_staged_update, staged, release)
         except Exception as exc:
             self._ui_call(self._update_download_failed, str(exc))
@@ -1899,84 +1927,100 @@ class BTDControlCenter:
         self.append_log(f"Update download/verification failed: {error}")
         messagebox.showerror(
             "Update failed",
-            f"The update was not installed. Your current app was not changed.\n\n{error}",
+            f"The update could not be verified or downloaded. Your current version was not changed.\n\n{error}",
             parent=self.root,
         )
 
     def _install_staged_update(self, staged_path: Path, release: dict) -> None:
         app_path = Path(__file__).resolve()
-        backup_path = None
-        marker = app_path.with_name(app_path.name + ".startup-ok")
-        child = None
+        backup_path: Path | None = None
         try:
             if self._recording_active or self._recording_pending or self._playback_active or self._high_angle_running:
-                raise RuntimeError("An automation action became active during download. Stop it and retry.")
+                raise RuntimeError("A feature became active while the update was downloading. Stop it and retry.")
             if self.docked_hwnd is not None and not self.undock_roblox():
-                raise RuntimeError("Roblox could not be safely undocked; update was not installed.")
+                raise RuntimeError("Roblox could not be safely undocked. The update was not installed.")
+
             backup_dir = app_path.parent / "backups"
             backup_dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             backup_path = backup_dir / f"BTD_Control_Center_{APP_VERSION}_{stamp}.py.bak"
             shutil.copy2(app_path, backup_path)
+
+            # Stage and live file share a directory, so os.replace is atomic.
             os.replace(staged_path, app_path)
-            marker.unlink(missing_ok=True)
-            env = os.environ.copy()
-            env["BTD_CC_BOOTSTRAPPED"] = "1"
-            env["BTD_CC_UPDATE_SUCCESS_FILE"] = str(marker)
-            startupinfo = None
-            creationflags = 0
-            if os.name == "nt":
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                startupinfo.wShowWindow = 0
-                creationflags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-            child = subprocess.Popen(
-                [sys.executable, str(app_path), *sys.argv[1:]],
-                cwd=str(app_path.parent), env=env,
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                close_fds=True, creationflags=creationflags, startupinfo=startupinfo,
-            )
-            deadline = time.monotonic() + 10.0
-            while time.monotonic() < deadline:
-                if marker.is_file():
-                    break
-                if child.poll() is not None:
-                    raise RuntimeError("The updated app exited before confirming startup.")
-                time.sleep(0.10)
-            else:
-                raise RuntimeError("The updated app did not confirm startup within 10 seconds.")
-            marker.unlink(missing_ok=True)
-            self.append_log(f"Updated to {release['version']}; startup confirmed; backup saved at {backup_path}.")
+            marker_path = app_path.with_name(app_path.name + ".startup-ok")
+            try:
+                marker_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            child = None
+            try:
+                env = os.environ.copy()
+                env["BTD_CC_BOOTSTRAPPED"] = "1"
+                env["BTD_CC_UPDATE_SUCCESS_FILE"] = str(marker_path)
+                startupinfo = None
+                creationflags = 0
+                if os.name == "nt":
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = 0
+                    creationflags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                child = subprocess.Popen(
+                    [sys.executable, str(app_path), *sys.argv[1:]],
+                    cwd=str(app_path.parent), env=env,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    close_fds=True, creationflags=creationflags, startupinfo=startupinfo,
+                )
+
+                # A successful Popen is not enough: the new app confirms that
+                # its GUI initialized and entered the event loop before exit.
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline:
+                    if marker_path.is_file():
+                        break
+                    if child.poll() is not None:
+                        raise RuntimeError("The updated app exited before confirming startup.")
+                    time.sleep(0.10)
+                else:
+                    raise RuntimeError("The updated app did not confirm startup within 10 seconds.")
+            except Exception:
+                if child is not None and child.poll() is None:
+                    try:
+                        child.terminate()
+                        child.wait(timeout=2.0)
+                    except Exception:
+                        try:
+                            child.kill()
+                        except Exception:
+                            pass
+                shutil.copy2(backup_path, app_path)
+                try:
+                    marker_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+
+            try:
+                marker_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.append_log(f"Updated to Control Center {release['version']}; startup confirmed; backup saved at {backup_path}.")
             self.set_status(f"Updated to version {release['version']}. Restarting...", "success")
             self._input_capture.stop()
             self._unregister_raw_mouse_input()
             self.root.after(250, self.root.destroy)
         except Exception as exc:
-            if child is not None and child.poll() is None:
-                try:
-                    child.terminate()
-                    child.wait(timeout=2.0)
-                except Exception:
-                    try:
-                        child.kill()
-                    except Exception:
-                        pass
-            if backup_path is not None and backup_path.exists():
-                try:
-                    shutil.copy2(backup_path, app_path)
-                except Exception as restore_exc:
-                    exc = RuntimeError(f"{exc}; backup restore also failed: {restore_exc}")
+            self._update_installing = False
             try:
-                staged_path.unlink(missing_ok=True)
-                marker.unlink(missing_ok=True)
+                if staged_path.exists():
+                    staged_path.unlink()
             except OSError:
                 pass
-            self._update_installing = False
-            self.set_status("Update failed; previous version was retained.", "error")
+            self.set_status("Update failed; current version was retained.", "error")
             self.append_log(f"Update install failed: {exc}")
             messagebox.showerror(
                 "Update failed",
-                f"The update did not complete. Your previous version was kept.\n\n{exc}",
+                f"The update was not completed. Your previous version was kept.\n\n{exc}",
                 parent=self.root,
             )
 
@@ -2280,7 +2324,8 @@ class BTDControlCenter:
                     win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOZORDER
                     | win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED,
                 ),
-            )            actual_owner = int(step("verify window owner", lambda: win32gui.GetWindow(hwnd, getattr(win32con, "GW_OWNER", 4))) or 0)
+            )
+            actual_owner = int(step("verify window owner", lambda: win32gui.GetWindow(hwnd, getattr(win32con, "GW_OWNER", 4))) or 0)
             if actual_owner != root_hwnd:
                 raise RuntimeError("Windows did not apply the expected Roblox owner relationship.")
             actual_ex = int(step("verify taskbar style", lambda: win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)))
@@ -2508,6 +2553,7 @@ def main() -> None:
                 Path(success_marker).write_text(APP_VERSION, encoding="ascii")
             except OSError:
                 pass
+        # Wait until Tk has processed its first layout/update callbacks.
         root.after(1200, confirm_startup)
     root.mainloop()
 
