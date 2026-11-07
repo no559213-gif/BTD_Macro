@@ -32,8 +32,8 @@ from urllib.request import Request, urlopen
 
 
 APP_NAME = "BTD Control Center"
-APP_VERSION = "1.0.3"
-APP_RELEASE_NOTES = "Changed High Angle positioning to move to the furthest safe point at the right edge of the Roblox client, then return 2 cm left at the same vertical center before the existing camera drag and zoom sequence."
+APP_VERSION = "1.0.4"
+APP_RELEASE_NOTES = "Added a recording library dropdown with Load/Delete/Refresh controls, automatic loading of newly saved recordings, and one-click playback of the loaded recording. High Angle now moves to the rightmost safe point and returns 1 cm left using a slower two-stage cursor path at the same vertical center."
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 
 # Familiar dark BTD Macro palette, independently defined for this application.
@@ -670,6 +670,9 @@ class BTDControlCenter:
         self._recording_held_keys: dict[str, str] = {}
         self._recording_held_buttons: dict[str, tuple[int, int]] = {}
         self._recording_file: Path | None = None
+        self._loaded_recording_path: Path | None = None
+        self._loaded_recording_actions: list[dict] = []
+        self._recording_paths_by_name: dict[str, Path] = {}
         self._recording_countdown_id = None
         self._runtime_poll_id = None
         self._playback_active = False
@@ -690,6 +693,7 @@ class BTDControlCenter:
 
         self._configure_styles()
         self._build_layout()
+        self._refresh_recording_library(restore_last=True)
         self.root.protocol("WM_DELETE_WINDOW", self.close_app)
         self.game_host.bind("<Configure>", self._on_game_host_configure, add="+")
         self.root.bind("<Configure>", self._on_root_configure, add="+")
@@ -717,6 +721,18 @@ class BTDControlCenter:
         style.configure(
             "TNotebook.Tab", background=PANEL_ALT, foreground=MUTED,
             padding=(18, 10), font=("Segoe UI Semibold", 10), borderwidth=0,
+        )
+        style.configure(
+            "Recording.TCombobox", fieldbackground=PANEL_ALT, background=PANEL_ALT,
+            foreground=TEXT, arrowcolor=ACCENT, bordercolor=BORDER,
+            lightcolor=BORDER, darkcolor=BORDER, padding=(6, 5),
+        )
+        style.map(
+            "Recording.TCombobox",
+            fieldbackground=[("readonly", PANEL_ALT)],
+            foreground=[("readonly", TEXT)],
+            selectbackground=[("readonly", PANEL_ALT)],
+            selectforeground=[("readonly", TEXT)],
         )
         style.map(
             "TNotebook.Tab",
@@ -829,11 +845,13 @@ class BTDControlCenter:
         self.log_text.configure(yscrollcommand=log_scroll.set)
 
     def _build_control_tab(self) -> None:
-        """The only tab contains exactly the four requested feature buttons."""
+        """One tab with four feature buttons plus an integrated recording manager."""
         tab = self.control_tab
-        for index in (0, 1):
-            tab.grid_rowconfigure(index, weight=1)
-            tab.grid_columnconfigure(index, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+        tab.grid_rowconfigure(2, weight=0)
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_columnconfigure(1, weight=1)
         buttons = (
             ("RECORDING", self.on_recording, ACCENT, "#101522", ACCENT_HOVER),
             ("PLAYBACK", self.on_playback, PANEL_ALT, TEXT, BORDER),
@@ -863,6 +881,50 @@ class BTDControlCenter:
                 self.high_angle_button = button
             elif label == "AUTO POSITION":
                 self.auto_position_button = button
+
+        manager = tk.Frame(tab, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        manager.grid(row=2, column=0, columnspan=2, sticky="ew", padx=14, pady=(7, 12))
+        manager.grid_columnconfigure(0, weight=1)
+        manager.grid_columnconfigure(1, weight=0)
+        manager.grid_columnconfigure(2, weight=0)
+        manager.grid_columnconfigure(3, weight=0)
+        tk.Label(
+            manager, text="RECORDING LIBRARY", bg=PANEL, fg=ACCENT,
+            font=("Segoe UI Semibold", 9),
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
+        self.recording_var = tk.StringVar(value="")
+        self.recording_combo = ttk.Combobox(
+            manager, textvariable=self.recording_var, state="readonly",
+            style="Recording.TCombobox",
+        )
+        self.recording_combo.grid(row=1, column=0, sticky="ew", padx=(10, 6), pady=(0, 7))
+        self.recording_combo.bind("<<ComboboxSelected>>", self._on_recording_selection_changed)
+        self.load_recording_button = tk.Button(
+            manager, text="LOAD", command=self.load_selected_recording,
+            bg=ACCENT, fg="#101522", activebackground=ACCENT_HOVER,
+            activeforeground="#101522", relief="flat", bd=0,
+            font=("Segoe UI Semibold", 8), padx=12, pady=7, cursor="hand2",
+        )
+        self.load_recording_button.grid(row=1, column=1, padx=3, pady=(0, 7))
+        self.delete_recording_button = tk.Button(
+            manager, text="DELETE", command=self.delete_selected_recording,
+            bg=PANEL_ALT, fg=TEXT, activebackground=BORDER,
+            activeforeground=TEXT, relief="flat", bd=0,
+            font=("Segoe UI Semibold", 8), padx=12, pady=7, cursor="hand2",
+        )
+        self.delete_recording_button.grid(row=1, column=2, padx=3, pady=(0, 7))
+        self.refresh_recordings_button = tk.Button(
+            manager, text="↻", command=self._refresh_recording_library,
+            bg=PANEL_ALT, fg=MUTED, activebackground=BORDER,
+            activeforeground=TEXT, relief="flat", bd=0,
+            font=("Segoe UI Semibold", 10), padx=10, pady=5, cursor="hand2",
+        )
+        self.refresh_recordings_button.grid(row=1, column=3, padx=(3, 10), pady=(0, 7))
+        self.loaded_recording_var = tk.StringVar(value="Loaded: none")
+        tk.Label(
+            manager, textvariable=self.loaded_recording_var, bg=PANEL, fg=MUTED,
+            anchor="w", font=("Segoe UI", 8),
+        ).grid(row=2, column=0, columnspan=4, sticky="ew", padx=10, pady=(0, 8))
 
     # ------------------------------------------------------------------
     # Recording, playback, and High Angle. Auto Position remains intentionally on hold.
@@ -1131,8 +1193,10 @@ class BTDControlCenter:
             return
         if saved_path:
             self._recording_file = saved_path
-            self.set_status(f"Recording saved: {saved_path.name} ({len(self._recording_actions)} actions).", "success")
-            self.append_log(f"Recording saved to {saved_path}; actions={len(self._recording_actions)}.")
+            self._refresh_recording_library(select_path=saved_path)
+            self._load_recording_path(saved_path)
+            self.set_status(f"Recording saved and loaded: {saved_path.name} ({len(self._recording_actions)} actions).", "success")
+            self.append_log(f"Recording saved and loaded to {saved_path}; actions={len(self._recording_actions)}.")
         else:
             self.set_status("No Roblox inputs were captured; no recording was saved.", "warning")
             self.append_log("Recording stopped without captured actions; no file was created.")
@@ -1183,6 +1247,115 @@ class BTDControlCenter:
                 })
         return actions
 
+    def _on_recording_selection_changed(self, _event=None) -> None:
+        selected = self.recording_var.get()
+        path = self._recording_paths_by_name.get(selected)
+        if path:
+            self.set_status(f"Selected recording: {path.name}. Load it before playback.", "idle")
+
+    def _refresh_recording_library(
+        self, *, select_path: Path | None = None, restore_last: bool = False
+    ) -> None:
+        current_selection = self.recording_var.get() if hasattr(self, "recording_var") else ""
+        files = sorted(
+            self.recordings_dir.glob("*.tsv"),
+            key=lambda path: (path.stat().st_mtime_ns, path.name.lower()),
+            reverse=True,
+        )
+        self._recording_paths_by_name = {path.name: path for path in files}
+        values = list(self._recording_paths_by_name)
+        self.recording_combo.configure(values=values)
+
+        desired = select_path.name if select_path else current_selection
+        if restore_last and not desired:
+            last_file = self.recordings_dir / ".last_loaded_recording"
+            try:
+                remembered = last_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                remembered = ""
+            if remembered in self._recording_paths_by_name:
+                desired = remembered
+        if desired not in self._recording_paths_by_name:
+            desired = values[0] if values else ""
+        self.recording_var.set(desired)
+        if not values:
+            self.recording_var.set("")
+        if hasattr(self, "loaded_recording_var"):
+            self._update_loaded_recording_label()
+
+    def _update_loaded_recording_label(self) -> None:
+        if self._loaded_recording_path and self._loaded_recording_actions:
+            self.loaded_recording_var.set(
+                f"Loaded: {self._loaded_recording_path.name}  ·  {len(self._loaded_recording_actions)} actions"
+            )
+        else:
+            self.loaded_recording_var.set("Loaded: none — select a recording and press LOAD")
+
+    def load_selected_recording(self) -> None:
+        selected = self.recording_var.get()
+        path = self._recording_paths_by_name.get(selected)
+        if not path or not path.is_file():
+            self.set_status("Select a saved recording from the dropdown first.", "warning")
+            return
+        self._load_recording_path(path)
+
+    def _load_recording_path(self, path: Path) -> bool:
+        try:
+            actions = self._load_recording_file(path)
+        except Exception as exc:
+            messagebox.showerror("Recording could not be loaded", str(exc), parent=self.root)
+            self.set_status(f"Recording load failed: {path.name}.", "error")
+            return False
+        if not actions:
+            messagebox.showwarning(
+                "Empty recording", "The selected file contains no supported actions.", parent=self.root
+            )
+            self.set_status(f"No supported actions in {path.name}.", "warning")
+            return False
+        self._loaded_recording_path = path
+        self._loaded_recording_actions = actions
+        try:
+            (self.recordings_dir / ".last_loaded_recording").write_text(path.name, encoding="utf-8")
+        except OSError as exc:
+            self.append_log(f"Could not remember loaded recording selection: {exc}")
+        self.recording_var.set(path.name)
+        self._update_loaded_recording_label()
+        self.set_status(f"Loaded {path.name} ({len(actions)} actions).", "success")
+        self.append_log(f"Loaded recording: {path.name}; actions={len(actions)}.")
+        return True
+
+    def delete_selected_recording(self) -> None:
+        selected = self.recording_var.get()
+        path = self._recording_paths_by_name.get(selected)
+        if not path or not path.is_file():
+            self.set_status("Select a saved recording to delete.", "warning")
+            return
+        if self._playback_active or self._recording_active or self._recording_pending:
+            self.set_status("Stop Recording and Playback before deleting a recording.", "warning")
+            return
+        if not messagebox.askyesno(
+            "Delete recording",
+            f"Permanently delete this recording?\n\n{path.name}",
+            parent=self.root,
+        ):
+            return
+        try:
+            path.unlink()
+        except OSError as exc:
+            messagebox.showerror("Delete failed", str(exc), parent=self.root)
+            return
+        if self._loaded_recording_path == path:
+            self._loaded_recording_path = None
+            self._loaded_recording_actions = []
+            try:
+                (self.recordings_dir / ".last_loaded_recording").unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._refresh_recording_library()
+        self._update_loaded_recording_label()
+        self.set_status(f"Deleted recording: {path.name}.", "success")
+        self.append_log(f"Deleted recording: {path.name}.")
+
     def on_playback(self) -> None:
         if self._playback_active:
             self.stop_playback()
@@ -1192,22 +1365,17 @@ class BTDControlCenter:
             return
         if not self._is_roblox_available():
             return
-        selected = filedialog.askopenfilename(
-            parent=self.root,
-            title="Choose a BTD recording to play",
-            initialdir=str(self.recordings_dir),
-            filetypes=(("BTD recordings", "*.tsv"), ("All files", "*.*")),
-        )
-        if not selected:
+        path = self._loaded_recording_path
+        actions = self._loaded_recording_actions
+        if not path or not actions:
+            self.set_status("No recording is loaded. Select one from the dropdown and press LOAD.", "warning")
+            self.append_log("Playback requested without a loaded recording.")
             return
-        path = Path(selected)
-        try:
-            actions = self._load_recording_file(path)
-        except Exception as exc:
-            messagebox.showerror("Recording could not be loaded", str(exc), parent=self.root)
-            return
-        if not actions:
-            messagebox.showwarning("Empty recording", "The selected file contains no supported actions.", parent=self.root)
+        if not path.is_file():
+            self._loaded_recording_path = None
+            self._loaded_recording_actions = []
+            self._update_loaded_recording_label()
+            self.set_status("The loaded recording file is missing. Select and load it again.", "error")
             return
         if not self._ensure_roblox_focus(self.docked_hwnd, 3000):
             self.set_status("Playback cancelled: Roblox focus could not be confirmed.", "error")
@@ -1221,7 +1389,7 @@ class BTDControlCenter:
         self._playback_active = True
         self.playback_button.configure(text="STOP PLAYBACK", bg=DANGER, fg="#FFFFFF")
         self.set_status(f"Playing {path.name} ({len(actions)} actions).", "progress")
-        self.append_log(f"Playback started from {path}; action count={len(actions)}.")
+        self.append_log(f"Playback started from loaded recording {path.name}; action count={len(actions)}.")
         self._playback_thread = threading.Thread(
             target=self._playback_worker,
             args=(self.docked_hwnd, actions, path),
@@ -1537,8 +1705,8 @@ class BTDControlCenter:
         self._high_angle_running = True
         self.high_angle_button.configure(text="STOP HIGH ANGLE", bg=DANGER, fg="#FFFFFF")
         self._input_capture.set_high_angle(True)
-        self.set_status("Applying High Angle from 15 cm right of the Roblox center...", "progress")
-        self.append_log("High Angle started at the center-right camera anchor (15 cm offset).")
+        self.set_status("Applying High Angle from 1 cm inside the Roblox right edge...", "progress")
+        self.append_log("High Angle started: move to furthest safe right point, then return 1 cm left.")
         self._high_angle_thread = threading.Thread(
             target=self._high_angle_worker,
             args=(self.docked_hwnd,),
@@ -1558,7 +1726,7 @@ class BTDControlCenter:
             self._ui_call(self._finish_high_angle, succeeded, error)
 
     def _run_high_angle_sequence(self, hwnd: int, *, playback_mode: bool) -> bool:
-        """Anchor at the rightmost safe client point, then return 2 cm left."""
+        """Move to the furthest safe right point, then return 1 cm left."""
         if not win32gui or not win32gui.IsWindow(hwnd):
             raise RuntimeError("Roblox window is no longer available.")
         if playback_mode:
@@ -1579,16 +1747,16 @@ class BTDControlCenter:
         if dpi < 48 or dpi > 960:
             dpi = 96
 
-        # First identify the furthest point that remains inside the client area,
-        # then return 2 physical centimeters to the left. Keep the vertical
-        # anchor at the exact client-area midpoint.
-        retreat_px = int(round((2.0 / 2.54) * dpi))
+        # The cursor deliberately visits the furthest safe client pixel first,
+        # then returns by 1 physical centimeter. Keep the final Y at client center.
+        retreat_px = max(1, int(round((1.0 / 2.54) * dpi)))
         safe_right_x = left + width - 1
         target_x = safe_right_x - retreat_px
+        center_x = left + width // 2
         target_y = top + height // 2
         if width <= retreat_px + 1:
             raise RuntimeError(
-                f"Roblox client is too narrow to leave a 2 cm right-edge margin at {dpi} DPI."
+                f"Roblox client is too narrow to leave a 1 cm right-edge margin at {dpi} DPI."
             )
         if self._high_angle_cancel.is_set() or (playback_mode and self._playback_stop.is_set()):
             return False
@@ -1599,8 +1767,31 @@ class BTDControlCenter:
         )
         if not anchor_focus_ok:
             raise RuntimeError("Roblox lost focus before the camera anchor move.")
-        if not user32.SetCursorPos(int(target_x), int(target_y)):
+
+        def move_smooth(start_x: int, end_x: int, duration: float, steps: int) -> bool:
+            for index in range(1, steps + 1):
+                if self._high_angle_cancel.is_set() or (playback_mode and self._playback_stop.is_set()):
+                    return False
+                focused = self._playback_focus(hwnd)
+                if not focused:
+                    raise RuntimeError("Roblox lost focus during the High Angle cursor positioning.")
+                fraction = index / steps
+                x = int(round(start_x + (end_x - start_x) * fraction))
+                if not user32.SetCursorPos(x, int(target_y)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                time.sleep(duration / steps)
+            return True
+
+        # Start in the middle, travel slowly all the way to the safe right edge,
+        # pause briefly, then ease back 1 cm to establish the final camera anchor.
+        if not user32.SetCursorPos(int(center_x), int(target_y)):
             raise ctypes.WinError(ctypes.get_last_error())
+        time.sleep(0.080)
+        if not move_smooth(center_x, safe_right_x, 0.600, 30):
+            return False
+        time.sleep(0.180)
+        if not move_smooth(safe_right_x, target_x, 0.350, 12):
+            return False
         time.sleep(0.250)
         if self._high_angle_cancel.is_set() or (playback_mode and self._playback_stop.is_set()):
             return False
@@ -1667,8 +1858,8 @@ class BTDControlCenter:
             self.set_status(f"High Angle failed: {error}", "error")
             self.append_log(f"High Angle failed: {error}")
         elif succeeded:
-            self.set_status("High Angle completed (15 cm rightward anchor).", "success")
-            self.append_log("High Angle finished: right-drag and 15 zoom-out notches completed.")
+            self.set_status("High Angle completed (1 cm inside right edge).", "success")
+            self.append_log("High Angle finished: eased to safe right edge, returned 1 cm, completed right-drag and 15 zoom-out notches.")
         else:
             self.set_status("High Angle stopped.", "warning")
             self.append_log("High Angle was cancelled before completion.")
