@@ -61,6 +61,8 @@ def _configure_winapi() -> None:
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
     user32.SetCursorPos.restype = wintypes.BOOL
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+    user32.GetCursorPos.restype = wintypes.BOOL
     user32.SendInput.restype = wintypes.UINT
     user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
     user32.RegisterHotKey.restype = wintypes.BOOL
@@ -362,13 +364,13 @@ class HighAngleApp:
             if not ensure_roblox_focus(hwnd):
                 raise RuntimeError("Could not bring Roblox Player into focus.")
             left, top, width, height, dpi = client_geometry(hwnd)
-            retreat_px = max(1, int(round((2.0 / 2.54) * dpi)))
+            retreat_px = max(1, int(round((4.0 / 2.54) * dpi)))
             safe_right_x = left + width - 1
             target_x = safe_right_x - retreat_px
             center_x = left + width // 2
             target_y = top + height // 2
             if width <= retreat_px + 1:
-                raise RuntimeError("Roblox client is too narrow for the 2 cm right-edge inset.")
+                raise RuntimeError("Roblox client is too narrow for the 4 cm right-edge inset.")
 
             def check_active() -> bool:
                 if self.cancel.is_set():
@@ -379,23 +381,37 @@ class HighAngleApp:
                     raise RuntimeError("Roblox lost focus during High Angle.")
                 return True
 
-            def move_smooth(start_x: int, end_x: int, duration: float, steps: int) -> bool:
+            def move_smooth(
+                start_x: int, start_y: int, end_x: int, end_y: int,
+                duration: float, steps: int,
+            ) -> bool:
+                # Smoothstep easing with a frame-like cadence. Every segment is
+                # interpolated; the cursor is never teleported to a waypoint.
+                steps = max(2, int(steps))
+                interval = duration / steps
                 for index in range(1, steps + 1):
                     if not check_active():
                         return False
-                    x = int(round(start_x + (end_x - start_x) * (index / steps)))
-                    if not user32.SetCursorPos(x, target_y):
+                    t = index / steps
+                    eased = t * t * (3.0 - 2.0 * t)
+                    x = int(round(start_x + (end_x - start_x) * eased))
+                    y = int(round(start_y + (end_y - start_y) * eased))
+                    if not user32.SetCursorPos(x, y):
                         raise ctypes.WinError(ctypes.get_last_error())
-                    time.sleep(duration / steps)
+                    time.sleep(interval)
                 return True
 
-            if not user32.SetCursorPos(center_x, target_y):
+            # Begin at the actual pointer location and glide into the game
+            # center before making the rightward pass.
+            cursor = wintypes.POINT()
+            if not user32.GetCursorPos(ctypes.byref(cursor)):
                 raise ctypes.WinError(ctypes.get_last_error())
-            time.sleep(0.080)
-            if not move_smooth(center_x, safe_right_x, 0.600, 30):
+            if not move_smooth(int(cursor.x), int(cursor.y), center_x, target_y, 0.700, 48):
+                return
+            if not move_smooth(center_x, target_y, safe_right_x, target_y, 0.850, 54):
                 return
             time.sleep(0.180)
-            if not move_smooth(safe_right_x, target_x, 0.350, 12):
+            if not move_smooth(safe_right_x, target_y, target_x, target_y, 0.550, 36):
                 return
             time.sleep(0.250)
             if not check_active():
@@ -419,7 +435,8 @@ class HighAngleApp:
                     send_mouse(flags=0x0010)  # MOUSEEVENTF_RIGHTUP
                     right_down = False
 
-            # High Angle intentionally ends after the camera drag; no zoom input.\n            succeeded = True
+            # High Angle intentionally ends after the camera drag; no zoom input.
+            succeeded = True
         except Exception as exc:
             error = str(exc)
         finally:
