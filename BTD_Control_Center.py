@@ -1,26 +1,39 @@
-"""BTD Control Center 1.0.0 - standalone one-tab Roblox companion GUI.
+"""BTD Control Center 1.0.1 - standalone one-tab Roblox companion GUI.
 
 This application is independent of BTD_Macro_1.0.48.py. It recreates the
 window layout, Roblox docking, Global Status, and Activity Log as a separate
-program. The four feature buttons are UI entry points; game-specific feature
-engines are not yet connected in this initial standalone build.
+program. Recording, Playback, and High Angle are implemented here; Auto
+Position is intentionally left for a later BTD-specific image matcher.
 """
 from __future__ import annotations
 
+import csv
 import ctypes
+import hashlib
+import hmac
+import json
 import os
+import queue
+import re
+import shutil
 import subprocess
 import sys
+import threading
+import time
 import textwrap
 import tkinter as tk
 from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
+from urllib.error import HTTPError
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 
 
 APP_NAME = "BTD Control Center"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
+APP_RELEASE_NOTES = "Added GitHub auto-update checks, release notes, SHA-256 verification, timestamped backups, and startup-confirmed rollback."
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 
 # Familiar dark BTD Macro palette, independently defined for this application.
@@ -48,6 +61,110 @@ except ImportError:
     win32con = None
     win32gui = None
     PYWIN32_AVAILABLE = False
+
+
+# Dedicated tag namespace: Control Center never consumes BTD Macro releases.
+UPDATE_REPOSITORY = "no559213-gif/BTD_Macro"
+UPDATE_TAG_PREFIX = "control-center-v"
+UPDATE_ASSET_NAME = "BTD_Control_Center.py"
+UPDATE_CHECKSUM_ASSET_NAME = "BTD_Control_Center.py.sha256"
+UPDATE_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _version_tuple(value: str) -> tuple[int, int, int] | None:
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", str(value).strip())
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def _read_github_url(url: str, max_bytes: int, accept: str = "application/octet-stream") -> bytes:
+    allowed = {"api.github.com", "github.com", "release-assets.githubusercontent.com"}
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in allowed:
+        raise ValueError("Untrusted update URL.")
+    request = Request(url, headers={
+        "User-Agent": "BTD-Control-Center-Updater",
+        "Accept": accept,
+        "X-GitHub-Api-Version": "2022-11-28",
+    })
+    with urlopen(request, timeout=20) as response:
+        if urlparse(response.geturl()).hostname not in allowed:
+            raise ValueError("GitHub redirected to an untrusted host.")
+        payload = response.read(max_bytes + 1)
+    if len(payload) > max_bytes:
+        raise ValueError("Update download exceeds the size limit.")
+    return payload
+
+
+def _find_latest_control_center_release() -> dict | None:
+    tags_url = (f"https://api.github.com/repos/{UPDATE_REPOSITORY}"
+                f"/git/matching-refs/tags/{UPDATE_TAG_PREFIX}")
+    refs = json.loads(_read_github_url(
+        tags_url, 2 * 1024 * 1024, "application/vnd.github+json"
+    ).decode("utf-8"))
+    versions = []
+    for item in refs if isinstance(refs, list) else []:
+        tag = str(item.get("ref", "")).rsplit("/", 1)[-1]
+        if tag.startswith(UPDATE_TAG_PREFIX):
+            version = tag[len(UPDATE_TAG_PREFIX):]
+            parsed = _version_tuple(version)
+            if parsed is not None:
+                versions.append((parsed, tag, version))
+    for _parsed, tag, version in sorted(versions, reverse=True):
+        release_url = (f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/tags/"
+                       f"{quote(tag, safe='')}")
+        try:
+            data = _read_github_url(release_url, 512 * 1024, "application/vnd.github+json")
+        except HTTPError as exc:
+            if exc.code == 404:
+                continue
+            raise
+        release = json.loads(data.decode("utf-8"))
+        if release.get("draft") or release.get("prerelease"):
+            continue
+        assets = {str(a.get("name", "")): a for a in release.get("assets", [])}
+        script = assets.get(UPDATE_ASSET_NAME)
+        checksum = assets.get(UPDATE_CHECKSUM_ASSET_NAME)
+        if script and checksum:
+            return {
+                "version": version, "tag": tag,
+                "notes": str(release.get("body", "")).strip(),
+                "script_url": script.get("browser_download_url"),
+                "checksum_url": checksum.get("browser_download_url"),
+                "digest": str(script.get("digest", "") or ""),
+            }
+    return None
+
+
+def _download_and_validate_update(release: dict, current_version: str, app_path: Path) -> Path:
+    urls = (str(release.get("script_url", "")), str(release.get("checksum_url", "")))
+    asset_prefix = f"/{UPDATE_REPOSITORY}/releases/download/"
+    for url in urls:
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or parsed.hostname != "github.com" or not parsed.path.startswith(asset_prefix):
+            raise ValueError("Unexpected GitHub release asset URL.")
+    payload = _read_github_url(urls[0], UPDATE_MAX_BYTES)
+    checksum_text = _read_github_url(urls[1], 4096).decode("ascii", errors="replace").strip()
+    expected = checksum_text.split()[0].lower() if checksum_text else ""
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise ValueError("Missing or invalid SHA-256 checksum.")
+    actual = hashlib.sha256(payload).hexdigest()
+    if not hmac.compare_digest(actual, expected):
+        raise ValueError("Downloaded update failed SHA-256 verification.")
+    digest = str(release.get("digest", "") or "")
+    if digest.startswith("sha256:") and not hmac.compare_digest(actual, digest.split(":", 1)[1].lower()):
+        raise ValueError("Checksum does not match GitHub's asset digest.")
+    source_text = payload.decode("utf-8")
+    match = re.search(r"""^APP_VERSION\s*=\s*["']([^"']+)["']""", source_text, re.MULTILINE)
+    if not match or match.group(1) != str(release.get("version", "")):
+        raise ValueError("Downloaded app version does not match the release tag.")
+    new_version = _version_tuple(match.group(1))
+    old_version = _version_tuple(current_version)
+    if new_version is None or old_version is None or new_version <= old_version:
+        raise ValueError("Downloaded version is not newer than the installed version.")
+    compile(source_text, str(app_path), "exec")
+    staged = app_path.with_name(app_path.name + ".download")
+    staged.write_bytes(payload)
+    return staged
 
 
 def relaunch_without_console() -> None:
@@ -97,6 +214,404 @@ def configure_dpi_awareness() -> None:
         pass
 
 
+class WindowsInputCapture:
+    """Capture physical global keyboard/mouse events while Roblox is foreground.
+
+    Low-level hooks capture key/button/wheel/absolute pointer events. Raw Input
+    relative mouse deltas are supplied by the Tk window subclass for right-drag
+    camera movement when Roblox locks the cursor.
+    """
+
+    WH_KEYBOARD_LL = 13
+    WH_MOUSE_LL = 14
+    HC_ACTION = 0
+    WM_KEYDOWN = 0x0100
+    WM_KEYUP = 0x0101
+    WM_SYSKEYDOWN = 0x0104
+    WM_SYSKEYUP = 0x0105
+    WM_MOUSEMOVE = 0x0200
+    WM_LBUTTONDOWN = 0x0201
+    WM_LBUTTONUP = 0x0202
+    WM_RBUTTONDOWN = 0x0204
+    WM_RBUTTONUP = 0x0205
+    WM_MBUTTONDOWN = 0x0207
+    WM_MBUTTONUP = 0x0208
+    WM_MOUSEWHEEL = 0x020A
+    WM_XBUTTONDOWN = 0x020B
+    WM_XBUTTONUP = 0x020C
+    WM_MOUSEHWHEEL = 0x020E
+    WM_QUIT = 0x0012
+    LLKHF_EXTENDED = 0x01
+    LLKHF_INJECTED = 0x10
+    LLKHF_UP = 0x80
+    LLMHF_INJECTED = 0x01
+    MOUSE_MOVE_ABSOLUTE = 0x01
+
+    def __init__(self, hwnd_provider, event_sink) -> None:
+        self._hwnd_provider = hwnd_provider
+        self._event_sink = event_sink
+        self._thread: threading.Thread | None = None
+        self._thread_id = 0
+        self._ready = threading.Event()
+        self._stop = threading.Event()
+        self._recording_enabled = False
+        self._high_angle_active = False
+        self._right_button_held = False
+        self._raw_input_available = False
+        self._last_screen_point: tuple[int, int] | None = None
+        self._last_normal_move_ns = 0
+        self._captured_keys: dict[tuple[int, int], str] = {}
+        self._captured_buttons: dict[str, tuple[int, int]] = {}
+        self._state_lock = threading.RLock()
+        self._keyboard_hook = None
+        self._mouse_hook = None
+        self._keyboard_proc = None
+        self._mouse_proc = None
+        self._hook_error = ""
+        self._f8_down = False
+
+    @property
+    def active(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def right_button_held(self) -> bool:
+        with self._state_lock:
+            return self._right_button_held
+
+    @property
+    def raw_input_available(self) -> bool:
+        return self._raw_input_available
+
+    @property
+    def hook_error(self) -> str:
+        return self._hook_error
+
+    def set_recording(self, enabled: bool) -> None:
+        with self._state_lock:
+            self._recording_enabled = bool(enabled)
+            if not enabled:
+                self._last_screen_point = None
+                self._last_normal_move_ns = 0
+
+    def set_high_angle(self, enabled: bool) -> None:
+        with self._state_lock:
+            self._high_angle_active = bool(enabled)
+
+    def _is_target_foreground(self) -> bool:
+        hwnd = self._hwnd_provider()
+        if not hwnd or os.name != "nt":
+            return False
+        try:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.GetForegroundWindow.restype = wintypes.HWND
+            return int(user32.GetForegroundWindow() or 0) == int(hwnd)
+        except Exception:
+            return False
+
+    def _enqueue(self, kind: str, value: str = "", x: int = 0, y: int = 0) -> None:
+        self._event_sink({
+            "timestamp_ns": time.perf_counter_ns(),
+            "type": kind,
+            "value": value,
+            "x": int(x),
+            "y": int(y),
+        })
+
+    @staticmethod
+    def _client_point(hwnd: int, screen_x: int, screen_y: int) -> tuple[int, int] | None:
+        try:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+            user32.ScreenToClient.restype = wintypes.BOOL
+            user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+            user32.GetClientRect.restype = wintypes.BOOL
+            point = wintypes.POINT(int(screen_x), int(screen_y))
+            if not user32.ScreenToClient(wintypes.HWND(hwnd), ctypes.byref(point)):
+                return None
+            rect = wintypes.RECT()
+            if not user32.GetClientRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+                return None
+            if not (rect.left <= point.x < rect.right and rect.top <= point.y < rect.bottom):
+                return None
+            return int(point.x), int(point.y)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _key_name(vk: int, scan: int, flags: int) -> str:
+        try:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            get_name = user32.GetKeyNameTextW
+            get_name.argtypes = [ctypes.c_long, wintypes.LPWSTR, ctypes.c_int]
+            get_name.restype = ctypes.c_int
+            lparam = (int(scan) & 0xFF) << 16
+            if flags & WindowsInputCapture.LLKHF_EXTENDED:
+                lparam |= 1 << 24
+            buffer = ctypes.create_unicode_buffer(128)
+            if get_name(lparam, buffer, len(buffer)) > 0 and buffer.value:
+                return buffer.value
+        except Exception:
+            pass
+        return f"VK_{int(vk):02X}"
+
+    def start(self, *, recording: bool = False) -> bool:
+        if os.name != "nt":
+            self._hook_error = "Global input capture is supported on Windows only."
+            return False
+        if self.active:
+            self.set_recording(recording)
+            return True
+        self._stop.clear()
+        self._ready.clear()
+        self._hook_error = ""
+        self.set_recording(recording)
+        self._thread = threading.Thread(
+            target=self._hook_thread_main,
+            name="BTDInputCapture",
+            daemon=True,
+        )
+        self._thread.start()
+        if not self._ready.wait(3.0):
+            self._hook_error = "Windows input hooks did not initialize in time."
+            self.stop()
+            return False
+        if self._hook_error:
+            self.stop()
+            return False
+        return True
+
+    def stop(self) -> None:
+        self.set_recording(False)
+        self._stop.set()
+        thread_id = self._thread_id
+        if thread_id and os.name == "nt":
+            try:
+                user32 = ctypes.WinDLL("user32", use_last_error=True)
+                user32.PostThreadMessageW(thread_id, self.WM_QUIT, 0, 0)
+            except Exception:
+                pass
+        thread = self._thread
+        if thread and thread.is_alive() and threading.current_thread() is not thread:
+            thread.join(timeout=2.0)
+        self._thread = None
+        self._thread_id = 0
+        with self._state_lock:
+            self._right_button_held = False
+            self._captured_keys.clear()
+            self._captured_buttons.clear()
+
+    def _hook_thread_main(self) -> None:
+        try:
+            from ctypes import wintypes
+
+            LRESULT = ctypes.c_ssize_t
+            HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, ctypes.c_size_t, ctypes.c_ssize_t)
+
+            class KBDLLHOOKSTRUCT(ctypes.Structure):
+                _fields_ = [
+                    ("vkCode", wintypes.DWORD),
+                    ("scanCode", wintypes.DWORD),
+                    ("flags", wintypes.DWORD),
+                    ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_size_t),
+                ]
+
+            class MSLLHOOKSTRUCT(ctypes.Structure):
+                _fields_ = [
+                    ("pt", wintypes.POINT),
+                    ("mouseData", wintypes.DWORD),
+                    ("flags", wintypes.DWORD),
+                    ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_size_t),
+                ]
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            user32.GetForegroundWindow.restype = wintypes.HWND
+            user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, ctypes.c_size_t, ctypes.c_ssize_t]
+            user32.CallNextHookEx.restype = LRESULT
+            user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+            user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+            user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+            user32.GetMessageW.restype = ctypes.c_int
+            user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]
+            user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, ctypes.c_size_t, ctypes.c_ssize_t]
+            user32.PostThreadMessageW.restype = wintypes.BOOL
+            self._thread_id = int(kernel32.GetCurrentThreadId())
+            # Create the message queue before the main thread attempts WM_QUIT.
+            message = wintypes.MSG()
+            user32.PeekMessageW(ctypes.byref(message), None, 0, 0, 0)
+
+            def keyboard_callback(code, wparam, lparam):
+                try:
+                    if code == self.HC_ACTION and not self._stop.is_set():
+                        info = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                        vk = int(info.vkCode)
+                        scan = int(info.scanCode)
+                        flags = int(info.flags)
+                        is_up = bool(flags & self.LLKHF_UP) or int(wparam) in (self.WM_KEYUP, self.WM_SYSKEYUP)
+                        is_down = int(wparam) in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN)
+                        injected = bool(flags & self.LLKHF_INJECTED)
+                        if vk == 0x77 and not injected:
+                            # F8 remains the global Emergency Stop key while an action runs.
+                            if is_down and not is_up and not self._f8_down:
+                                self._f8_down = True
+                                self._enqueue("emergency", "F8")
+                            elif is_up:
+                                self._f8_down = False
+                        elif not injected:
+                            key_id = (vk, scan)
+                            if is_down:
+                                with self._state_lock:
+                                    enabled = self._recording_enabled and not self._high_angle_active
+                                    already = key_id in self._captured_keys
+                                if enabled and not already and self._is_target_foreground():
+                                    name = self._key_name(vk, scan, flags)
+                                    if name.upper() != "F8":
+                                        with self._state_lock:
+                                            self._captured_keys[key_id] = name
+                                        self._enqueue("keyDown", name)
+                            elif is_up:
+                                with self._state_lock:
+                                    name = self._captured_keys.pop(key_id, None)
+                                    if name is None:
+                                        # Some extended keys report a slightly different scan code on key-up.
+                                        for existing_id, existing_name in list(self._captured_keys.items()):
+                                            if existing_id[0] == vk:
+                                                name = self._captured_keys.pop(existing_id)
+                                                break
+                                if name is not None:
+                                    self._enqueue("keyUp", name)
+                except Exception:
+                    pass
+                return user32.CallNextHookEx(self._keyboard_hook, code, wparam, lparam)
+
+            def mouse_callback(code, wparam, lparam):
+                try:
+                    if code == self.HC_ACTION and not self._stop.is_set():
+                        info = ctypes.cast(lparam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                        msg = int(wparam)
+                        flags = int(info.flags)
+                        if not (flags & self.LLMHF_INJECTED):
+                            hwnd = self._hwnd_provider()
+                            if hwnd:
+                                x_screen, y_screen = int(info.pt.x), int(info.pt.y)
+                                point = self._client_point(hwnd, x_screen, y_screen)
+                                with self._state_lock:
+                                    enabled = self._recording_enabled and not self._high_angle_active
+                                    right_held = self._right_button_held
+                                    raw_ready = self._raw_input_available
+                                if msg == self.WM_MOUSEMOVE and enabled and self._is_target_foreground():
+                                    if right_held:
+                                        if not raw_ready:
+                                            previous = self._last_screen_point
+                                            self._last_screen_point = (x_screen, y_screen)
+                                            if previous:
+                                                dx, dy = x_screen - previous[0], y_screen - previous[1]
+                                                if dx or dy:
+                                                    self._enqueue("moveRel", "", dx, dy)
+                                    elif point is not None:
+                                        current = point
+                                        now_ns = time.perf_counter_ns()
+                                        if (current != self._last_screen_point
+                                            and now_ns - self._last_normal_move_ns >= 4_000_000):
+                                            self._last_screen_point = current
+                                            self._last_normal_move_ns = now_ns
+                                            self._enqueue("move", "", current[0], current[1])
+                                elif msg in (self.WM_LBUTTONDOWN, self.WM_LBUTTONUP,
+                                             self.WM_RBUTTONDOWN, self.WM_RBUTTONUP,
+                                             self.WM_MBUTTONDOWN, self.WM_MBUTTONUP,
+                                             self.WM_XBUTTONDOWN, self.WM_XBUTTONUP):
+                                    down = msg in (self.WM_LBUTTONDOWN, self.WM_RBUTTONDOWN,
+                                                   self.WM_MBUTTONDOWN, self.WM_XBUTTONDOWN)
+                                    if msg in (self.WM_LBUTTONDOWN, self.WM_LBUTTONUP):
+                                        button = "Left"
+                                    elif msg in (self.WM_RBUTTONDOWN, self.WM_RBUTTONUP):
+                                        button = "Right"
+                                    elif msg in (self.WM_MBUTTONDOWN, self.WM_MBUTTONUP):
+                                        button = "Middle"
+                                    else:
+                                        xbutton = (int(info.mouseData) >> 16) & 0xFFFF
+                                        button = "X1" if xbutton == 1 else "X2"
+                                    if down and enabled and point is not None and self._is_target_foreground():
+                                        with self._state_lock:
+                                            if button not in self._captured_buttons:
+                                                self._captured_buttons[button] = point
+                                                if button == "Right":
+                                                    self._right_button_held = True
+                                                    self._last_screen_point = (x_screen, y_screen)
+                                                capture_point = True
+                                            else:
+                                                capture_point = False
+                                        if capture_point:
+                                            self._enqueue("buttonDown", button, point[0], point[1])
+                                    elif not down:
+                                        with self._state_lock:
+                                            saved_point = self._captured_buttons.pop(button, None)
+                                            if button == "Right":
+                                                self._right_button_held = False
+                                                self._last_screen_point = point
+                                        if saved_point is not None:
+                                            release_point = point or saved_point
+                                            self._enqueue("buttonUp", button, release_point[0], release_point[1])
+                                elif msg in (self.WM_MOUSEWHEEL, self.WM_MOUSEHWHEEL) and enabled and point is not None and self._is_target_foreground():
+                                    signed_delta = ctypes.c_short((int(info.mouseData) >> 16) & 0xFFFF).value
+                                    amount = max(1, min(120, abs(int(signed_delta))))
+                                    if msg == self.WM_MOUSEWHEEL:
+                                        direction = "WheelUp" if signed_delta > 0 else "WheelDown"
+                                    else:
+                                        direction = "WheelRight" if signed_delta > 0 else "WheelLeft"
+                                    self._enqueue("wheel", f"{direction}@{amount}", point[0], point[1])
+                except Exception:
+                    pass
+                return user32.CallNextHookEx(self._mouse_hook, code, wparam, lparam)
+
+            self._keyboard_proc = HOOKPROC(keyboard_callback)
+            self._mouse_proc = HOOKPROC(mouse_callback)
+            user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
+            user32.SetWindowsHookExW.restype = wintypes.HHOOK
+            kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+            kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
+            kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+            module = kernel32.GetModuleHandleW(None)
+            self._keyboard_hook = user32.SetWindowsHookExW(self.WH_KEYBOARD_LL, self._keyboard_proc, module, 0)
+            self._mouse_hook = user32.SetWindowsHookExW(self.WH_MOUSE_LL, self._mouse_proc, module, 0)
+            if not self._keyboard_hook or not self._mouse_hook:
+                err = ctypes.get_last_error()
+                self._hook_error = f"Could not install Windows input hooks (error {err})."
+                self._ready.set()
+                return
+            self._ready.set()
+            while not self._stop.is_set():
+                result = user32.GetMessageW(ctypes.byref(message), None, 0, 0)
+                if result <= 0:
+                    break
+                user32.TranslateMessage(ctypes.byref(message))
+                user32.DispatchMessageW(ctypes.byref(message))
+        except Exception as exc:
+            self._hook_error = f"Windows input hooks failed: {exc}"
+            self._ready.set()
+        finally:
+            try:
+                user32 = ctypes.WinDLL("user32", use_last_error=True)
+                if self._keyboard_hook:
+                    user32.UnhookWindowsHookEx(self._keyboard_hook)
+                if self._mouse_hook:
+                    user32.UnhookWindowsHookEx(self._mouse_hook)
+            except Exception:
+                pass
+            self._keyboard_hook = None
+            self._mouse_hook = None
+            self._ready.set()
+
+    def record_raw_mouse_delta(self, dx: int, dy: int) -> None:
+        with self._state_lock:
+            allowed = self._recording_enabled and not self._high_angle_active and self._right_button_held
+        if allowed and (dx or dy) and self._is_target_foreground():
+            self._enqueue("moveRel", "", dx, dy)
+
+
 class BTDControlCenter:
     """Fresh standalone GUI with a single four-button tab and separate status."""
 
@@ -113,6 +628,41 @@ class BTDControlCenter:
         self._overlay_position_pending = False
         self._maximizing_window = False
 
+        # Recording/playback state is kept in this application, independently of
+        # the old BTD Macro. The .tsv rows remain compatible with the TDX format.
+        self.recordings_dir = Path(__file__).resolve().parent / "recordings"
+        self.recordings_dir.mkdir(parents=True, exist_ok=True)
+        self._capture_events: queue.SimpleQueue = queue.SimpleQueue()
+        self._input_capture = WindowsInputCapture(
+            lambda: self.docked_hwnd, self._capture_event_sink
+        )
+        self._recording_actions: list[dict] = []
+        self._recording_active = False
+        self._recording_pending = False
+        self._recording_finalize = False
+        self._recording_stop_after_high_angle = False
+        self._recording_last_action_ns = 0
+        self._recording_held_keys: dict[str, str] = {}
+        self._recording_held_buttons: dict[str, tuple[int, int]] = {}
+        self._recording_file: Path | None = None
+        self._recording_countdown_id = None
+        self._runtime_poll_id = None
+        self._playback_active = False
+        self._playback_stop = threading.Event()
+        self._playback_thread: threading.Thread | None = None
+        self._playback_held_keys: set[str] = set()
+        self._playback_held_buttons: set[str] = set()
+        self._high_angle_running = False
+        self._high_angle_cancel = threading.Event()
+        self._high_angle_thread: threading.Thread | None = None
+        self._injected_right_button_down = False
+        self._raw_input_subclass_installed = False
+        self._raw_input_subclass_proc = None
+        self._raw_input_registered = False
+        self._update_check_thread: threading.Thread | None = None
+        self._update_download_thread: threading.Thread | None = None
+        self._update_installing = False
+
         self._configure_styles()
         self._build_layout()
         self.root.protocol("WM_DELETE_WINDOW", self.close_app)
@@ -125,6 +675,8 @@ class BTDControlCenter:
             self.append_log("pywin32 is missing; Roblox docking is unavailable on this computer.")
         self.set_status("Idle — ready.", "idle")
         self.root.after_idle(self._maximize_and_lock_window)
+        self.root.after_idle(self._install_raw_input_receiver)
+        self.root.after(2200, self._start_update_check)
 
     # ------------------------------------------------------------------
     # Theme and layout
@@ -277,26 +829,1156 @@ class BTDControlCenter:
                 padx=(14 if column == 0 else 7, 7 if column == 0 else 14),
                 pady=(14 if row == 0 else 7, 7 if row == 0 else 14),
             )
+            if label == "RECORDING":
+                self.record_button = button
+            elif label == "PLAYBACK":
+                self.playback_button = button
+            elif label == "HIGH ANGLE":
+                self.high_angle_button = button
+            elif label == "AUTO POSITION":
+                self.auto_position_button = button
 
     # ------------------------------------------------------------------
-    # Feature entry points. The UI is real; engines need separate game logic.
+    # Recording, playback, and High Angle. Auto Position remains intentionally on hold.
     # ------------------------------------------------------------------
-    def _feature_not_connected(self, feature: str) -> None:
-        message = f"{feature} is not connected yet in this standalone build."
-        self.set_status(message, "warning")
-        self.append_log(message)
+    def _is_roblox_available(self) -> bool:
+        if not self.docked_hwnd:
+            self.set_status("Dock Roblox first.", "warning")
+            self.append_log("Feature requested while Roblox was not docked.")
+            return False
+        if os.name != "nt" or not PYWIN32_AVAILABLE:
+            self.set_status("This feature requires Windows and pywin32.", "error")
+            self.append_log("Feature unavailable: Windows/pywin32 support is missing.")
+            return False
+        if not win32gui.IsWindow(self.docked_hwnd):
+            self._handle_lost_roblox_window()
+            return False
+        return True
+
+    def _ensure_roblox_focus(self, hwnd: int, timeout_ms: int = 3000) -> bool:
+        """Restore the intended Roblox foreground window without sending input elsewhere."""
+        if os.name != "nt" or not hwnd:
+            return False
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        if not user32.IsWindow(wintypes.HWND(hwnd)):
+            return False
+        try:
+            if user32.IsIconic(wintypes.HWND(hwnd)):
+                user32.ShowWindow(wintypes.HWND(hwnd), 9)  # SW_RESTORE
+                self.root.after_idle(lambda: self._schedule_overlay_position(show=True))
+        except Exception:
+            pass
+
+        foreground_value = user32.GetForegroundWindow()
+        foreground = int(foreground_value or 0)
+        if foreground == hwnd:
+            return True
+        foreground_pid = wintypes.DWORD()
+        target_pid = wintypes.DWORD()
+        foreground_tid = int(user32.GetWindowThreadProcessId(wintypes.HWND(foreground), ctypes.byref(foreground_pid))) if foreground else 0
+        target_tid = int(user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(target_pid)))
+        current_tid = int(kernel32.GetCurrentThreadId())
+        attached_foreground = False
+        attached_target = False
+        try:
+            if foreground_tid and foreground_tid != current_tid:
+                attached_foreground = bool(user32.AttachThreadInput(current_tid, foreground_tid, True))
+            if target_tid and target_tid != current_tid:
+                attached_target = bool(user32.AttachThreadInput(current_tid, target_tid, True))
+            try:
+                user32.AllowSetForegroundWindow(0xFFFFFFFF)  # ASFW_ANY
+            except Exception:
+                pass
+            user32.BringWindowToTop(wintypes.HWND(hwnd))
+            user32.SetForegroundWindow(wintypes.HWND(hwnd))
+            user32.SetActiveWindow(wintypes.HWND(hwnd))
+            user32.SetFocus(wintypes.HWND(hwnd))
+        finally:
+            if attached_target:
+                user32.AttachThreadInput(current_tid, target_tid, False)
+            if attached_foreground:
+                user32.AttachThreadInput(current_tid, foreground_tid, False)
+
+        deadline = time.perf_counter() + max(0, timeout_ms) / 1000.0
+        while time.perf_counter() < deadline:
+            if int(user32.GetForegroundWindow() or 0) == hwnd:
+                return True
+            time.sleep(0.025)
+        return int(user32.GetForegroundWindow() or 0) == hwnd
+
+    def _capture_event_sink(self, event: dict) -> None:
+        if event.get("type") == "emergency":
+            # Interrupt long-running workers immediately; UI state is finalized on the Tk thread.
+            self._playback_stop.set()
+            self._high_angle_cancel.set()
+        self._capture_events.put(event)
+
+    def _start_capture_hooks(self, *, recording: bool = False) -> bool:
+        if recording:
+            self._register_raw_mouse_input()
+        if not self._input_capture.start(recording=recording):
+            self.set_status(self._input_capture.hook_error or "Could not start input capture.", "error")
+            self.append_log(self._input_capture.hook_error or "Input capture failed to start.")
+            return False
+        self._schedule_runtime_poll()
+        return True
+
+    def _stop_capture_hooks_if_idle(self) -> None:
+        if not self._recording_active and not self._recording_pending and not self._playback_active and not self._high_angle_running:
+            self._input_capture.stop()
+            if self._runtime_poll_id is not None:
+                try:
+                    self.root.after_cancel(self._runtime_poll_id)
+                except tk.TclError:
+                    pass
+                self._runtime_poll_id = None
+
+    def _schedule_runtime_poll(self) -> None:
+        if self._runtime_poll_id is not None:
+            return
+        delay = 4 if self._recording_active or self._recording_finalize else 20
+        self._runtime_poll_id = self.root.after(delay, self._poll_runtime_events)
+
+    def _poll_runtime_events(self) -> None:
+        self._runtime_poll_id = None
+        captured = []
+        while True:
+            try:
+                captured.append(self._capture_events.get_nowait())
+            except queue.Empty:
+                break
+        if captured:
+            captured.sort(key=lambda item: int(item.get("timestamp_ns", 0)))
+            for event in captured:
+                if event.get("type") == "emergency":
+                    self._emergency_stop()
+                elif self._recording_active or self._recording_finalize:
+                    self._process_recording_event(event)
+        if self._recording_active or self._recording_finalize or self._playback_active or self._high_angle_running:
+            self._schedule_runtime_poll()
+
+    def _append_recording_action(
+        self, action_type: str, value: str = "", x: int = 0, y: int = 0,
+        *, timestamp_ns: int | None = None,
+    ) -> None:
+        stamp = timestamp_ns if timestamp_ns is not None else time.perf_counter_ns()
+        if self._recording_last_action_ns <= 0:
+            delay_ms = 0.0
+        else:
+            delay_ms = max(0.0, (stamp - self._recording_last_action_ns) / 1_000_000.0)
+        self._recording_last_action_ns = max(stamp, self._recording_last_action_ns)
+        self._recording_actions.append({
+            "type": action_type,
+            "value": str(value).replace("\t", " "),
+            "x": int(x),
+            "y": int(y),
+            "delay": delay_ms,
+        })
+
+    def _process_recording_event(self, event: dict) -> None:
+        kind = str(event.get("type", ""))
+        value = str(event.get("value", ""))
+        x, y = int(event.get("x", 0)), int(event.get("y", 0))
+        stamp = int(event.get("timestamp_ns", time.perf_counter_ns()))
+        if kind == "keyDown":
+            if value not in self._recording_held_keys:
+                self._recording_held_keys[value] = value
+                self._append_recording_action(kind, value, timestamp_ns=stamp)
+        elif kind == "keyUp":
+            held = self._recording_held_keys.pop(value, None)
+            if held is not None:
+                self._append_recording_action(kind, value, timestamp_ns=stamp)
+        elif kind == "buttonDown":
+            if value not in self._recording_held_buttons:
+                self._recording_held_buttons[value] = (x, y)
+                self._append_recording_action(kind, value, x, y, timestamp_ns=stamp)
+        elif kind == "buttonUp":
+            if value in self._recording_held_buttons:
+                self._recording_held_buttons.pop(value, None)
+                self._append_recording_action(kind, value, x, y, timestamp_ns=stamp)
+        elif kind in ("move", "moveRel", "wheel"):
+            if kind != "move" or not self._recording_actions or (
+                self._recording_actions[-1]["type"] != "move"
+                or self._recording_actions[-1]["x"] != x
+                or self._recording_actions[-1]["y"] != y
+            ):
+                self._append_recording_action(kind, value, x, y, timestamp_ns=stamp)
 
     def on_recording(self) -> None:
-        self._feature_not_connected("Recording")
+        if self._recording_active and self._high_angle_running:
+            self._recording_stop_after_high_angle = True
+            self.record_button.configure(text="STOP AFTER HIGH ANGLE", bg=DANGER, fg="#FFFFFF")
+            self.set_status("Recording will stop after the High Angle sequence finishes.", "warning")
+            return
+        if self._recording_active or self._recording_pending:
+            self.stop_recording()
+            return
+        if self._playback_active or self._high_angle_running:
+            self.set_status("Stop Playback or High Angle before starting a recording.", "warning")
+            return
+        if not self._is_roblox_available():
+            return
+        if not self._ensure_roblox_focus(self.docked_hwnd, 3000):
+            self.set_status("Recording cancelled: Roblox focus could not be confirmed.", "error")
+            self.append_log("Recording was not started because Roblox did not receive foreground focus.")
+            return
+        self._recording_pending = True
+        self.record_button.configure(text="CANCEL RECORDING", bg=DANGER, fg="#FFFFFF")
+        self.set_status("Recording starts in 3 seconds. Prepare the Roblox actions.", "progress")
+        self.append_log("Roblox focus confirmed; recording countdown started (3 seconds).")
+        self._recording_countdown_id = self.root.after(3000, self._begin_recording)
+
+    def _begin_recording(self) -> None:
+        self._recording_countdown_id = None
+        if not self._recording_pending:
+            return
+        self._recording_pending = False
+        if not self._is_roblox_available() or not self._ensure_roblox_focus(self.docked_hwnd, 1800):
+            self.record_button.configure(text="RECORDING", bg=ACCENT, fg="#101522")
+            self.set_status("Recording cancelled: Roblox focus was not confirmed.", "error")
+            return
+        self._recording_actions = []
+        self._recording_held_keys.clear()
+        self._recording_held_buttons.clear()
+        self._recording_last_action_ns = time.perf_counter_ns()
+        if not self._start_capture_hooks(recording=True):
+            self._unregister_raw_mouse_input()
+            self.record_button.configure(text="RECORDING", bg=ACCENT, fg="#101522")
+            return
+        self._recording_active = True
+        self._recording_finalize = False
+        self.record_button.configure(text="STOP RECORDING", bg=DANGER, fg="#FFFFFF")
+        if not self._input_capture.raw_input_available:
+            self.set_status("Recording. Relative mouse camera movement fallback is limited.", "warning")
+            self.append_log("Raw Input registration is unavailable; right-drag camera motion may not be captured precisely.")
+        else:
+            self.set_status("Recording Roblox keyboard and mouse actions.", "progress")
+        self.append_log("Recording started. Keyboard, mouse buttons, wheel, and cursor movement are being captured.")
+        self._schedule_runtime_poll()
+
+    def stop_recording(self) -> None:
+        if self._recording_pending:
+            self._recording_pending = False
+            if self._recording_countdown_id is not None:
+                try:
+                    self.root.after_cancel(self._recording_countdown_id)
+                except tk.TclError:
+                    pass
+                self._recording_countdown_id = None
+            self.record_button.configure(text="RECORDING", bg=ACCENT, fg="#101522")
+            self.set_status("Recording countdown cancelled.", "warning")
+            self.append_log("Recording cancelled before capture began.")
+            self._unregister_raw_mouse_input()
+            self._stop_capture_hooks_if_idle()
+            return
+        if not self._recording_active:
+            return
+        self._recording_active = False
+        self._recording_finalize = True
+        self._input_capture.set_recording(False)
+        if not self._high_angle_running and not self._playback_active:
+            self._input_capture.stop()
+        self._poll_runtime_events()
+        now = time.perf_counter_ns()
+        # Close physically held states so a recording never leaves an input held.
+        for key_name in list(self._recording_held_keys.values()):
+            self._append_recording_action("keyUp", key_name, timestamp_ns=now)
+        self._recording_held_keys.clear()
+        for button_name, point in list(self._recording_held_buttons.items()):
+            self._append_recording_action("buttonUp", button_name, point[0], point[1], timestamp_ns=now)
+        self._recording_held_buttons.clear()
+        if self._recording_actions:
+            self._append_recording_action("wait", "", timestamp_ns=time.perf_counter_ns())
+        self._recording_finalize = False
+        self._unregister_raw_mouse_input()
+        self.record_button.configure(text="RECORDING", bg=ACCENT, fg="#101522")
+        try:
+            saved_path = self._save_recording()
+        except Exception as exc:
+            self.set_status(f"Recording save failed: {exc}", "error")
+            self.append_log(f"Recording save failed: {exc}")
+            self._stop_capture_hooks_if_idle()
+            return
+        if saved_path:
+            self._recording_file = saved_path
+            self.set_status(f"Recording saved: {saved_path.name} ({len(self._recording_actions)} actions).", "success")
+            self.append_log(f"Recording saved to {saved_path}; actions={len(self._recording_actions)}.")
+        else:
+            self.set_status("No Roblox inputs were captured; no recording was saved.", "warning")
+            self.append_log("Recording stopped without captured actions; no file was created.")
+        self._stop_capture_hooks_if_idle()
+
+    def _save_recording(self) -> Path | None:
+        if not self._recording_actions:
+            return None        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = self.recordings_dir / f"BTD_Recording_{stamp}.tsv"
+        serial = 2
+        while output_path.exists():
+            output_path = self.recordings_dir / f"BTD_Recording_{stamp}_{serial}.tsv"
+            serial += 1
+        with output_path.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.writer(stream, delimiter="\t", lineterminator="\r\n")
+            for action in self._recording_actions:
+                writer.writerow((
+                    action["type"], action["value"], action["x"], action["y"],
+                    f"{action['delay']:.3f}",
+                ))
+        return output_path
+
+    @staticmethod
+    def _load_recording_file(path: Path) -> list[dict]:
+        allowed = {"move", "moveRel", "keyDown", "keyUp", "buttonDown", "buttonUp", "wheel", "highAngle", "wait"}
+        actions: list[dict] = []
+        with path.open("r", encoding="utf-8-sig", newline="") as stream:
+            reader = csv.reader(stream, delimiter="\t")
+            for row in reader:
+                if len(row) < 5:
+                    continue
+                action_type = row[0].replace("\ufeff", "").strip()
+                if action_type not in allowed:
+                    continue
+                try:
+                    x = int(float(row[2]))
+                    y = int(float(row[3]))
+                    delay = max(0.0, float(row[4]))
+                except (ValueError, OverflowError):
+                    continue
+                actions.append({
+                    "type": action_type,
+                    "value": row[1],
+                    "x": x,
+                    "y": y,
+                    "delay": delay,
+                })
+        return actions
 
     def on_playback(self) -> None:
-        self._feature_not_connected("Playback")
+        if self._playback_active:
+            self.stop_playback()
+            return
+        if self._recording_active or self._recording_pending or self._high_angle_running:
+            self.set_status("Stop Recording and High Angle before starting Playback.", "warning")
+            return
+        if not self._is_roblox_available():
+            return
+        selected = filedialog.askopenfilename(
+            parent=self.root,
+            title="Choose a BTD recording to play",
+            initialdir=str(self.recordings_dir),
+            filetypes=(("BTD recordings", "*.tsv"), ("All files", "*.*")),
+        )
+        if not selected:
+            return
+        path = Path(selected)
+        try:
+            actions = self._load_recording_file(path)
+        except Exception as exc:
+            messagebox.showerror("Recording could not be loaded", str(exc), parent=self.root)
+            return
+        if not actions:
+            messagebox.showwarning("Empty recording", "The selected file contains no supported actions.", parent=self.root)
+            return
+        if not self._ensure_roblox_focus(self.docked_hwnd, 3000):
+            self.set_status("Playback cancelled: Roblox focus could not be confirmed.", "error")
+            return
+        if not self._start_capture_hooks(recording=False):
+            return
+        self._playback_stop.clear()
+        self._high_angle_cancel.clear()
+        self._playback_held_keys.clear()
+        self._playback_held_buttons.clear()
+        self._playback_active = True
+        self.playback_button.configure(text="STOP PLAYBACK", bg=DANGER, fg="#FFFFFF")
+        self.set_status(f"Playing {path.name} ({len(actions)} actions).", "progress")
+        self.append_log(f"Playback started from {path}; action count={len(actions)}.")
+        self._playback_thread = threading.Thread(
+            target=self._playback_worker,
+            args=(self.docked_hwnd, actions, path),
+            name="BTDPlayback",
+            daemon=True,
+        )
+        self._playback_thread.start()
+
+    def stop_playback(self) -> None:
+        if not self._playback_active:
+            return
+        self._playback_stop.set()
+        self.set_status("Stopping Playback and releasing held inputs safely...", "warning")
+
+    @staticmethod
+    def _key_name_to_vk(name: str) -> int:
+        value = name.strip()
+        special = {
+            "Backspace": 0x08, "Tab": 0x09, "Enter": 0x0D, "Return": 0x0D,
+            "Shift": 0x10, "Ctrl": 0x11, "Control": 0x11, "Alt": 0x12,
+            "Pause": 0x13, "Caps Lock": 0x14, "CapsLock": 0x14,
+            "Esc": 0x1B, "Escape": 0x1B, "Space": 0x20,
+            "Page Up": 0x21, "PageUp": 0x21, "Page Down": 0x22, "PageDown": 0x22,
+            "End": 0x23,
+            "Home": 0x24, "Left": 0x25, "Up": 0x26, "Right": 0x27,
+            "Down": 0x28, "Print Screen": 0x2C, "Insert": 0x2D, "Delete": 0x2E,
+            "Num Lock": 0x90, "NumLock": 0x90, "Scroll Lock": 0x91, "ScrollLock": 0x91,
+            "LWin": 0x5B, "RWin": 0x5C, "AppsKey": 0x5D,
+            "Left Shift": 0xA0, "Right Shift": 0xA1,
+            "LShift": 0xA0, "RShift": 0xA1,
+            "Left Ctrl": 0xA2, "Right Ctrl": 0xA3,
+            "LCtrl": 0xA2, "RCtrl": 0xA3,
+            "Left Control": 0xA2, "Right Control": 0xA3,
+            "Left Alt": 0xA4, "Right Alt": 0xA5,
+            "LAlt": 0xA4, "RAlt": 0xA5,
+            "Back": 0x08,
+        }
+        if value in special:
+            return special[value]
+        upper = value.upper()
+        if len(upper) == 1 and ("A" <= upper <= "Z" or "0" <= upper <= "9"):
+            return ord(upper)
+        if upper.startswith("F") and upper[1:].isdigit():
+            number = int(upper[1:])
+            if 1 <= number <= 24:
+                return 0x70 + number - 1
+        if upper.startswith("VK_"):
+            try:
+                return int(upper[3:], 16)
+            except ValueError:
+                pass
+        if value.lower().startswith("num ") and value[-1:].isdigit():
+            return 0x60 + int(value[-1])
+        if upper.startswith("NUMPAD") and upper[-1:].isdigit():
+            return 0x60 + int(upper[-1])
+        numpad_ops = {
+            "NUMPADMULTIPLY": 0x6A, "NUMPADADD": 0x6B,
+            "NUMPADSUBTRACT": 0x6D, "NUMPADDECIMAL": 0x6E,
+            "NUMPADDIVIDE": 0x6F, "NUMPADENTER": 0x0D,
+        }
+        if upper in numpad_ops:
+            return numpad_ops[upper]
+        if len(value) == 1:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            result = int(user32.VkKeyScanW(ord(value)))
+            if result != -1:
+                return result & 0xFF
+        raise ValueError(f"Unsupported recorded keyboard key: {name}")
+
+    @staticmethod
+    def _send_key_input(name: str, key_up: bool) -> None:
+        vk = BTDControlCenter._key_name_to_vk(name)
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.c_size_t)]
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                        ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                        ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+        class HARDWAREINPUT(ctypes.Structure):
+            _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+        class INPUT_UNION(ctypes.Union):
+            _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT), ("hi", HARDWAREINPUT)]
+        class INPUT(ctypes.Structure):
+            _anonymous_ = ("u",)
+            _fields_ = [("type", wintypes.DWORD), ("u", INPUT_UNION)]
+        flags = 0x0002 if key_up else 0
+        packet = INPUT(type=1, ki=KEYBDINPUT(vk, 0, flags, 0, 0))
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+        user32.SendInput.restype = wintypes.UINT
+        if user32.SendInput(1, ctypes.byref(packet), ctypes.sizeof(INPUT)) != 1:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    @staticmethod
+    def _send_mouse_input(dx: int = 0, dy: int = 0, flags: int = 0, data: int = 0) -> None:
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                        ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                        ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.c_size_t)]
+        class HARDWAREINPUT(ctypes.Structure):
+            _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+        class INPUT_UNION(ctypes.Union):
+            _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+        class INPUT(ctypes.Structure):
+            _anonymous_ = ("u",)
+            _fields_ = [("type", wintypes.DWORD), ("u", INPUT_UNION)]
+        packet = INPUT(type=0, mi=MOUSEINPUT(int(dx), int(dy), int(data) & 0xFFFFFFFF, int(flags), 0, 0))
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+        user32.SendInput.restype = wintypes.UINT
+        if user32.SendInput(1, ctypes.byref(packet), ctypes.sizeof(INPUT)) != 1:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def _send_mouse_button(self, button: str, down: bool) -> None:
+        flags = {
+            "Left": (0x0002, 0x0004, 0),
+            "Right": (0x0008, 0x0010, 0),
+            "Middle": (0x0020, 0x0040, 0),
+            "X1": (0x0080, 0x0100, 0x0001),
+            "X2": (0x0080, 0x0100, 0x0002),
+        }
+        if button not in flags:
+            raise ValueError(f"Unsupported mouse button: {button}")
+        down_flag, up_flag, data = flags[button]
+        self._send_mouse_input(flags=down_flag if down else up_flag, data=data)
+
+    def _playback_focus(self, hwnd: int) -> bool:
+        if not win32gui or not win32gui.IsWindow(hwnd):
+            return False
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        return int(user32.GetForegroundWindow() or 0) == int(hwnd)
+
+    def _wait_playback_target(self, target_time: float, hwnd: int) -> tuple[bool, float]:
+        """Wait to an absolute timeline target while pausing for focus recovery."""
+        recovery_total = 0.0
+        while not self._playback_stop.is_set():
+            if not win32gui or not win32gui.IsWindow(hwnd):
+                return False, recovery_total
+            if not self._playback_focus(hwnd):
+                recovery_start = time.perf_counter()
+                self._ui_status("Roblox focus lost; attempting safe focus recovery...", "warning")
+                if not self._ensure_roblox_focus(hwnd, 5000):
+                    return False, recovery_total
+                recovery = max(0.0, time.perf_counter() - recovery_start)
+                recovery_total += recovery
+                target_time += recovery
+                # Release held inputs only after Roblox is confirmed foreground.
+                self._release_playback_inputs(hwnd)
+                self._ui_log(f"Roblox focus restored during playback; timeline paused for {recovery:.3f}s.")
+            remaining = target_time - time.perf_counter()
+            if remaining <= 0:
+                return True, recovery_total
+            time.sleep(min(0.04, max(0.001, remaining - 0.002)))
+        return False, recovery_total
+
+    def _client_geometry(self, hwnd: int) -> tuple[int, int, int, int]:
+        if not win32gui or not win32gui.IsWindow(hwnd):
+            raise RuntimeError("Roblox window is not available.")
+        left, top = win32gui.ClientToScreen(hwnd, (0, 0))
+        client_rect = win32gui.GetClientRect(hwnd)
+        width, height = client_rect[2] - client_rect[0], client_rect[3] - client_rect[1]
+        if width < 100 or height < 100:
+            raise RuntimeError("Roblox client area is too small.")
+        return int(left), int(top), int(width), int(height)
+
+    def _move_playback_cursor(self, hwnd: int, x: int, y: int) -> None:
+        if not self._playback_focus(hwnd):
+            raise RuntimeError("Roblox lost foreground focus immediately before mouse input.")
+        left, top, width, height = self._client_geometry(hwnd)
+        px = max(left, min(left + width - 1, left + int(x)))
+        py = max(top, min(top + height - 1, top + int(y)))
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        if not user32.SetCursorPos(px, py):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def _playback_action(self, hwnd: int, action: dict) -> None:
+        kind, value = action["type"], action["value"]
+        x, y = action["x"], action["y"]
+        if kind == "wait":
+            return
+        if kind == "highAngle":
+            if not self._run_high_angle_sequence(hwnd, playback_mode=True):
+                raise RuntimeError("Playback was stopped during High Angle.")
+            return
+        if not self._playback_focus(hwnd):
+            raise RuntimeError("Roblox is not foreground; no recorded input was sent.")
+        if kind == "move":
+            self._move_playback_cursor(hwnd, x, y)
+        elif kind == "moveRel":
+            self._send_mouse_input(dx=x, dy=y, flags=0x0001)  # MOUSEEVENTF_MOVE
+        elif kind in ("buttonDown", "buttonUp"):
+            if value != "Right":
+                self._move_playback_cursor(hwnd, x, y)
+            down = kind == "buttonDown"
+            self._send_mouse_button(value, down)
+            if down:
+                self._playback_held_buttons.add(value)
+            else:
+                self._playback_held_buttons.discard(value)
+        elif kind in ("keyDown", "keyUp"):
+            down = kind == "keyDown"
+            self._send_key_input(value, not down)
+            if down:
+                self._playback_held_keys.add(value)
+            else:
+                self._playback_held_keys.discard(value)
+        elif kind == "wheel":
+            self._move_playback_cursor(hwnd, x, y)
+            direction, _, amount_text = value.partition("@")
+            amount = max(1, min(120, abs(int(amount_text or "120"))))
+            if direction == "WheelUp":
+                self._send_mouse_input(flags=0x0800, data=amount)
+            elif direction == "WheelDown":
+                self._send_mouse_input(flags=0x0800, data=-amount)
+            elif direction == "WheelRight":
+                self._send_mouse_input(flags=0x1000, data=amount)
+            elif direction == "WheelLeft":
+                self._send_mouse_input(flags=0x1000, data=-amount)
+            else:
+                raise ValueError(f"Unsupported recorded wheel direction: {direction}")
+
+    def _release_playback_inputs(self, hwnd: int) -> None:
+        if not self._playback_held_keys and not self._playback_held_buttons:
+            return
+        if not self._ensure_roblox_focus(hwnd, 1500):
+            self._ui_log("Could not confirm Roblox focus to release playback inputs; no key-up was sent to another app.")
+            return
+        for key_name in list(self._playback_held_keys):
+            try:
+                self._send_key_input(key_name, True)
+            except Exception as exc:
+                self._ui_log(f"Key release failed for {key_name}: {exc}")
+        for button_name in list(self._playback_held_buttons):
+            try:
+                self._send_mouse_button(button_name, False)
+            except Exception as exc:
+                self._ui_log(f"Mouse release failed for {button_name}: {exc}")
+        self._playback_held_keys.clear()
+        self._playback_held_buttons.clear()
+
+    def _playback_worker(self, hwnd: int, actions: list[dict], path: Path) -> None:
+        started = time.perf_counter()
+        timeline_ms = 0.0
+        error = ""
+        try:
+            for index, action in enumerate(actions, start=1):
+                if self._playback_stop.is_set():
+                    break
+                timeline_ms += max(0.0, float(action["delay"]))
+                reached, recovery_seconds = self._wait_playback_target(started + timeline_ms / 1000.0, hwnd)
+                started += recovery_seconds
+                if not reached or self._playback_stop.is_set():
+                    break
+                if not self._playback_focus(hwnd):
+                    recovery_start = time.perf_counter()
+                    if not self._ensure_roblox_focus(hwnd, 3000):
+                        raise RuntimeError("Roblox focus could not be restored. Playback stopped before the next input.")
+                    started += max(0.0, time.perf_counter() - recovery_start)
+                    self._release_playback_inputs(hwnd)
+                if self._playback_stop.is_set():
+                    break
+                self._playback_action(hwnd, action)
+                if index % 100 == 0:
+                    self._ui_status(f"Playback in progress: {index}/{len(actions)} actions.", "progress")
+        except Exception as exc:
+            error = str(exc)
+        finally:
+            self._release_playback_inputs(hwnd)
+            self._ui_call(self._finish_playback, path, len(actions), error, self._playback_stop.is_set())
+
+    def _finish_playback(self, path: Path, action_count: int, error: str, stopped: bool) -> None:
+        self._playback_active = False
+        self.playback_button.configure(text="PLAYBACK", bg=PANEL_ALT, fg=TEXT)
+        if error:
+            self.set_status(f"Playback stopped: {error}", "error")
+            self.append_log(f"Playback failed for {path.name}: {error}")
+        elif stopped:
+            self.set_status("Playback stopped by user / Emergency Stop.", "warning")
+            self.append_log(f"Playback stopped before completion: {path.name}.")
+        else:
+            self.set_status(f"Playback completed: {path.name}.", "success")
+            self.append_log(f"Playback completed: {path.name}; actions={action_count}.")
+        self._playback_thread = None
+        self._playback_stop.clear()
+        self._high_angle_cancel.clear()
+        self._stop_capture_hooks_if_idle()
 
     def on_high_angle(self) -> None:
-        self._feature_not_connected("High Angle")
+        if self._high_angle_running:
+            self._high_angle_cancel.set()
+            self.set_status("Stopping High Angle safely...", "warning")
+            return
+        if self._playback_active or self._recording_pending:
+            self.set_status("Stop Playback / wait for Recording countdown before High Angle.", "warning")
+            return
+        if not self._is_roblox_available():
+            return
+        if not self._ensure_roblox_focus(self.docked_hwnd, 3000):
+            self.set_status("High Angle cancelled: Roblox focus could not be confirmed.", "error")
+            return
+        if self._recording_active:
+            self._append_recording_action("highAngle", "")
+        if not self._start_capture_hooks(recording=self._recording_active):
+            return
+        self._high_angle_cancel.clear()
+        self._high_angle_running = True
+        self.high_angle_button.configure(text="STOP HIGH ANGLE", bg=DANGER, fg="#FFFFFF")
+        self._input_capture.set_high_angle(True)
+        self.set_status("Applying High Angle from 3 cm right of the Roblox center...", "progress")
+        self.append_log("High Angle started at the center-right camera anchor (3 cm offset).")
+        self._high_angle_thread = threading.Thread(
+            target=self._high_angle_worker,
+            args=(self.docked_hwnd,),
+            name="BTDHighAngle",
+            daemon=True,
+        )
+        self._high_angle_thread.start()
+
+    def _high_angle_worker(self, hwnd: int) -> None:
+        error = ""
+        succeeded = False
+        try:
+            succeeded = self._run_high_angle_sequence(hwnd, playback_mode=False)
+        except Exception as exc:
+            error = str(exc)
+        finally:
+            self._ui_call(self._finish_high_angle, succeeded, error)
+
+    def _run_high_angle_sequence(self, hwnd: int, *, playback_mode: bool) -> bool:
+        """TDX camera movement, starting 3 cm right of the client-area center."""
+        if not win32gui or not win32gui.IsWindow(hwnd):
+            raise RuntimeError("Roblox window is no longer available.")
+        if playback_mode:
+            if not self._playback_focus(hwnd):
+                raise RuntimeError("Roblox lost focus before High Angle started.")
+        elif not self._ensure_roblox_focus(hwnd, 3000):
+            raise RuntimeError("Could not confirm Roblox focus before High Angle input.")
+
+        left, top, width, height = self._client_geometry(hwnd)
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        get_dpi = getattr(user32, "GetDpiForWindow", None)
+        if get_dpi:
+            get_dpi.argtypes = [wintypes.HWND]
+            get_dpi.restype = wintypes.UINT
+            dpi = int(get_dpi(wintypes.HWND(hwnd)))
+        else:
+            dpi = 96
+        if dpi < 48 or dpi > 960:
+            dpi = 96
+        right_offset_px = int(round((3.0 / 2.54) * dpi))
+        target_x = left + width // 2 + right_offset_px
+        target_y = top + height // 2
+        if target_x >= left + width:
+            raise RuntimeError(
+                f"Roblox client is too narrow for a 3 cm rightward offset at {dpi} DPI."
+            )
+        if self._high_angle_cancel.is_set() or (playback_mode and self._playback_stop.is_set()):
+            return False
+        anchor_focus_ok = (
+            self._playback_focus(hwnd)
+            if playback_mode
+            else self._ensure_roblox_focus(hwnd, 1200)
+        )
+        if not anchor_focus_ok:
+            raise RuntimeError("Roblox lost focus before the camera anchor move.")
+        if not user32.SetCursorPos(int(target_x), int(target_y)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        time.sleep(0.250)
+        if self._high_angle_cancel.is_set() or (playback_mode and self._playback_stop.is_set()):
+            return False
+        if playback_mode:
+            if not self._playback_focus(hwnd):
+                raise RuntimeError("Roblox lost focus before camera drag.")
+        elif not self._ensure_roblox_focus(hwnd, 1200):
+            raise RuntimeError("Roblox lost focus before camera drag.")
+
+        self._send_mouse_input(flags=0x0008)  # MOUSEEVENTF_RIGHTDOWN
+        self._injected_right_button_down = True
+        try:
+            time.sleep(0.100)
+            for step in range(50):
+                if self._high_angle_cancel.is_set() or (playback_mode and self._playback_stop.is_set()):
+                    return False
+                if playback_mode:
+                    focused = self._playback_focus(hwnd)
+                else:
+                    focused = self._playback_focus(hwnd)
+                if not focused:
+                    raise RuntimeError("Roblox lost focus during the High Angle camera drag.")
+                self._send_mouse_input(dx=0, dy=20, flags=0x0001)  # relative raw movement
+                time.sleep(0.008)
+            time.sleep(0.120)
+        finally:
+            # Do not send a release to another application if Roblox lost focus.
+            if self._playback_focus(hwnd):
+                try:
+                    self._send_mouse_input(flags=0x0010)  # MOUSEEVENTF_RIGHTUP
+                    self._injected_right_button_down = False
+                except Exception:
+                    pass
+            else:
+                if self._ensure_roblox_focus(hwnd, 1200):
+                    try:
+                        self._send_mouse_input(flags=0x0010)
+                        self._injected_right_button_down = False
+                    except Exception:
+                        pass
+
+        if self._high_angle_cancel.is_set() or (playback_mode and self._playback_stop.is_set()):
+            return False
+        for step in range(15):
+            if self._high_angle_cancel.is_set() or (playback_mode and self._playback_stop.is_set()):
+                return False
+            if not self._playback_focus(hwnd):
+                raise RuntimeError("Roblox lost focus during High Angle zoom-out.")
+            self._send_mouse_input(flags=0x0800, data=-120)  # MOUSEEVENTF_WHEEL, one notch down
+            time.sleep(0.045)
+        return True
+
+    def _finish_high_angle(self, succeeded: bool, error: str) -> None:
+        self._high_angle_running = False
+        self._input_capture.set_high_angle(False)
+        self.high_angle_button.configure(text="HIGH ANGLE", bg=PANEL_ALT, fg=TEXT)
+        self._high_angle_thread = None
+        should_stop_recording = self._recording_stop_after_high_angle and self._recording_active
+        self._recording_stop_after_high_angle = False
+        if self._recording_active:
+            # The AHK recorder resets its action clock after the synthetic camera sequence.
+            self._recording_last_action_ns = time.perf_counter_ns()
+        if error:
+            self.set_status(f"High Angle failed: {error}", "error")
+            self.append_log(f"High Angle failed: {error}")
+        elif succeeded:
+            self.set_status("High Angle completed (3 cm rightward anchor).", "success")
+            self.append_log("High Angle finished: right-drag and 15 zoom-out notches completed.")
+        else:
+            self.set_status("High Angle stopped.", "warning")
+            self.append_log("High Angle was cancelled before completion.")
+        self._high_angle_cancel.clear()
+        if should_stop_recording and self._recording_active:
+            self.stop_recording()
+        self._stop_capture_hooks_if_idle()
+
+    def _emergency_stop(self) -> None:
+        actions = []
+        if self._recording_active and self._high_angle_running:
+            self._recording_stop_after_high_angle = True
+            self.record_button.configure(text="STOP AFTER HIGH ANGLE", bg=DANGER, fg="#FFFFFF")
+            actions.append("recording will stop")
+        elif self._recording_active or self._recording_pending:
+            self.stop_recording()
+            actions.append("recording stopped")
+        if self._playback_active:
+            self._playback_stop.set()
+            actions.append("playback stopping")
+        if self._high_angle_running:
+            self._high_angle_cancel.set()
+            actions.append("High Angle stopping")
+        if not actions:
+            return
+        self.set_status("Emergency Stop: " + ", ".join(actions) + ".", "warning")
+        self.append_log("F8 Emergency Stop: " + ", ".join(actions) + ".")
 
     def on_auto_position(self) -> None:
-        self._feature_not_connected("Auto Position")
+        self.set_status("Auto Position is intentionally not implemented yet.", "warning")
+        self.append_log("Auto Position is on hold; only Recording, Playback, and High Angle are being implemented.")
+
+    def _ui_call(self, callback, *args) -> None:
+        try:
+            self.root.after(0, lambda: callback(*args))
+        except tk.TclError:
+            pass
+
+    def _ui_status(self, message: str, state: str = "idle") -> None:
+        self._ui_call(self.set_status, message, state)
+
+    def _ui_log(self, message: str) -> None:
+        self._ui_call(self.append_log, message)
+
+    # ------------------------------------------------------------------
+    # Raw mouse input receiver used to capture right-drag camera deltas.
+    # ------------------------------------------------------------------
+    def _install_raw_input_receiver(self) -> None:
+        if os.name != "nt" or self._raw_input_subclass_installed:
+            return
+        try:
+            from ctypes import wintypes
+            LRESULT = ctypes.c_ssize_t
+            SUBCLASSPROC = ctypes.WINFUNCTYPE(
+                LRESULT, wintypes.HWND, wintypes.UINT, ctypes.c_size_t,
+                ctypes.c_ssize_t, ctypes.c_size_t, ctypes.c_size_t,
+            )
+            comctl32 = ctypes.WinDLL("comctl32", use_last_error=True)
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            subclass_id = 0x42544443
+
+            def wndproc(hwnd, msg, wparam, lparam, _subclass_id, _ref_data):
+                if int(msg) == 0x00FF:  # WM_INPUT
+                    try:
+                        self._handle_raw_input(int(lparam))
+                    except Exception:
+                        pass
+                result = comctl32.DefSubclassProc(hwnd, msg, wparam, lparam)
+                if int(msg) == 0x0082:  # WM_NCDESTROY
+                    try:
+                        comctl32.RemoveWindowSubclass(hwnd, self._raw_input_subclass_proc, subclass_id)
+                    except Exception:
+                        pass
+                return result
+
+            self._raw_input_subclass_proc = SUBCLASSPROC(wndproc)
+            comctl32.SetWindowSubclass.argtypes = [wintypes.HWND, SUBCLASSPROC, ctypes.c_size_t, ctypes.c_size_t]
+            comctl32.SetWindowSubclass.restype = wintypes.BOOL
+            comctl32.DefSubclassProc.argtypes = [wintypes.HWND, wintypes.UINT, ctypes.c_size_t, ctypes.c_ssize_t]
+            comctl32.DefSubclassProc.restype = LRESULT
+            comctl32.RemoveWindowSubclass.argtypes = [wintypes.HWND, SUBCLASSPROC, ctypes.c_size_t]
+            hwnd = wintypes.HWND(self.root.winfo_id())
+            if not comctl32.SetWindowSubclass(hwnd, self._raw_input_subclass_proc, subclass_id, 0):
+                raise ctypes.WinError(ctypes.get_last_error())
+            self._raw_input_subclass_installed = True
+        except Exception as exc:
+            self.append_log(f"Raw mouse input receiver unavailable: {exc}")
+
+    def _register_raw_mouse_input(self) -> bool:
+        if os.name != "nt" or not self._raw_input_subclass_installed:
+            return False
+        try:
+            from ctypes import wintypes
+
+            class RAWINPUTDEVICE(ctypes.Structure):
+                _fields_ = [("usUsagePage", wintypes.USHORT), ("usUsage", wintypes.USHORT),
+                            ("dwFlags", wintypes.DWORD), ("hwndTarget", wintypes.HWND)]
+            device = RAWINPUTDEVICE(1, 2, 0x00000100, wintypes.HWND(self.root.winfo_id()))  # RIDEV_INPUTSINK
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.RegisterRawInputDevices.argtypes = [ctypes.POINTER(RAWINPUTDEVICE), wintypes.UINT, wintypes.UINT]
+            user32.RegisterRawInputDevices.restype = wintypes.BOOL
+            if not user32.RegisterRawInputDevices(ctypes.byref(device), 1, ctypes.sizeof(RAWINPUTDEVICE)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            self._raw_input_registered = True
+            self._input_capture._raw_input_available = True
+            return True
+        except Exception as exc:
+            self._raw_input_registered = False
+            self._input_capture._raw_input_available = False
+            self.append_log(f"Raw mouse capture not available; cursor-delta fallback will be used. {exc}")
+            return False
+
+    def _unregister_raw_mouse_input(self) -> None:
+        if os.name != "nt" or not self._raw_input_registered:
+            return
+        try:
+            from ctypes import wintypes
+            class RAWINPUTDEVICE(ctypes.Structure):
+                _fields_ = [("usUsagePage", wintypes.USHORT), ("usUsage", wintypes.USHORT),
+                            ("dwFlags", wintypes.DWORD), ("hwndTarget", wintypes.HWND)]
+            device = RAWINPUTDEVICE(1, 2, 0x00000001, wintypes.HWND())  # RIDEV_REMOVE
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.RegisterRawInputDevices.argtypes = [ctypes.POINTER(RAWINPUTDEVICE), wintypes.UINT, wintypes.UINT]
+            user32.RegisterRawInputDevices.restype = wintypes.BOOL
+            user32.RegisterRawInputDevices(ctypes.byref(device), 1, ctypes.sizeof(RAWINPUTDEVICE))
+        except Exception:
+            pass
+        self._raw_input_registered = False
+        self._input_capture._raw_input_available = False
+
+    def _handle_raw_input(self, raw_handle: int) -> None:
+        if not self._recording_active or not self._input_capture.right_button_held:
+            return
+        if not self.docked_hwnd or not self._input_capture._is_target_foreground():
+            return
+        from ctypes import wintypes
+
+        class RAWINPUTHEADER(ctypes.Structure):
+            _fields_ = [("dwType", wintypes.DWORD), ("dwSize", wintypes.DWORD),
+                        ("hDevice", wintypes.HANDLE), ("wParam", wintypes.WPARAM)]
+        class BUTTONS_STRUCT(ctypes.Structure):
+            _fields_ = [("usButtonFlags", wintypes.USHORT), ("usButtonData", wintypes.USHORT)]
+        class BUTTONS_UNION(ctypes.Union):
+            _fields_ = [("ulButtons", wintypes.ULONG), ("buttonStruct", BUTTONS_STRUCT)]
+        class RAWMOUSE(ctypes.Structure):
+            _anonymous_ = ("buttons",)
+            _fields_ = [("usFlags", wintypes.USHORT), ("buttons", BUTTONS_UNION),
+                        ("ulRawButtons", wintypes.ULONG), ("lLastX", wintypes.LONG),
+                        ("lLastY", wintypes.LONG), ("ulExtraInformation", wintypes.ULONG)]
+        class RAWINPUTDATA(ctypes.Union):
+            _fields_ = [("mouse", RAWMOUSE)]
+        class RAWINPUT(ctypes.Structure):
+            _anonymous_ = ("data",)
+            _fields_ = [("header", RAWINPUTHEADER), ("data", RAWINPUTDATA)]
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        size = wintypes.UINT(0)
+        header_size = ctypes.sizeof(RAWINPUTHEADER)
+        user32.GetRawInputData.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPVOID,
+                                           ctypes.POINTER(wintypes.UINT), wintypes.UINT]
+        user32.GetRawInputData.restype = wintypes.UINT
+        result = user32.GetRawInputData(wintypes.HANDLE(raw_handle), 0x10000003, None, ctypes.byref(size), header_size)
+        if result == 0xFFFFFFFF or size.value < ctypes.sizeof(RAWINPUT):
+            return
+        buffer = (ctypes.c_byte * size.value)()
+        read_size = wintypes.UINT(size.value)
+        result = user32.GetRawInputData(wintypes.HANDLE(raw_handle), 0x10000003, ctypes.byref(buffer), ctypes.byref(read_size), header_size)
+        if result == 0xFFFFFFFF:
+            return
+        raw = ctypes.cast(ctypes.byref(buffer), ctypes.POINTER(RAWINPUT)).contents
+        if raw.header.dwType != 0:
+            return
+        if raw.mouse.usFlags & WindowsInputCapture.MOUSE_MOVE_ABSOLUTE:
+            return
+        self._input_capture.record_raw_mouse_delta(int(raw.mouse.lLastX), int(raw.mouse.lLastY))
+
+    # ------------------------------------------------------------------
+    # GitHub updater: separate Control Center tag feed.
+    # ------------------------------------------------------------------
+    def _start_update_check(self) -> None:
+        if self._update_check_thread and self._update_check_thread.is_alive():
+            return
+        self.append_log(f"Checking for Control Center updates (current: {APP_VERSION})...")
+        self._update_check_thread = threading.Thread(
+            target=self._update_check_worker, name="BTDUpdateCheck", daemon=True
+        )
+        self._update_check_thread.start()
+
+    def _update_check_worker(self) -> None:
+        try:
+            release = _find_latest_control_center_release()
+            current = _version_tuple(APP_VERSION)
+            latest = _version_tuple(release["version"]) if release else None
+            if release and current and latest and latest > current:
+                self._ui_call(self._prompt_update, release)
+            else:
+                self._ui_call(
+                    self._update_check_finished,
+                    bool(release and current and latest and latest == current),
+                )
+        except Exception as exc:
+            self._ui_call(self._update_check_failed, str(exc))
+
+    def _update_check_finished(self, is_current: bool) -> None:
+        self.append_log(
+            f"Control Center is up to date ({APP_VERSION})."
+            if is_current else "No newer Control Center release is available."
+        )
+
+    def _update_check_failed(self, error: str) -> None:
+        self.append_log(f"Update check unavailable: {error}")
+
+    def _prompt_update(self, release: dict) -> None:
+        if self._update_installing:
+            return
+        notes = str(release.get("notes") or "No release notes provided.").strip()[:1800]
+        prompt = (
+            f"A new BTD Control Center version is available.\n\n"
+            f"Installed: {APP_VERSION}\nAvailable: {release['version']}\n\n"
+            f"Release notes:\n{notes}\n\nDownload and install this update now?"
+        )
+        self.append_log(f"Update available: {release['version']}.")
+        if not messagebox.askyesno("BTD Control Center update", prompt, parent=self.root):
+            self.append_log("Update postponed by user.")
+            return
+        if self._recording_active or self._recording_pending or self._playback_active or self._high_angle_running:
+            messagebox.showwarning(
+                "Finish current action first",
+                "Update paused because Recording, Playback, or High Angle is active. "
+                "Stop the action and restart the app to check again.",
+                parent=self.root,
+            )
+            return
+        if getattr(sys, "frozen", False):
+            messagebox.showinfo(
+                "Manual update required",
+                "The updater currently supports the Python .py build. Packaged executable updates must be installed manually.",
+                parent=self.root,
+            )
+            return
+        self._update_installing = True
+        self.set_status(f"Downloading update {release['version']}...", "progress")
+        self.append_log(f"Downloading Control Center {release['version']} from GitHub.")
+        self._update_download_thread = threading.Thread(
+            target=self._update_download_worker, args=(release,),
+            name="BTDUpdateDownload", daemon=True,
+        )
+        self._update_download_thread.start()
+
+    def _update_download_worker(self, release: dict) -> None:
+        try:
+            staged = _download_and_validate_update(release, APP_VERSION, Path(__file__).resolve())
+            self._ui_call(self._install_staged_update, staged, release)
+        except Exception as exc:
+            self._ui_call(self._update_download_failed, str(exc))
+
+    def _update_download_failed(self, error: str) -> None:
+        self._update_installing = False
+        self.set_status("Update failed; current version is unchanged.", "error")
+        self.append_log(f"Update download/verification failed: {error}")
+        messagebox.showerror(
+            "Update failed",
+            f"The update was not installed. Your current app was not changed.\n\n{error}",
+            parent=self.root,
+        )
+
+    def _install_staged_update(self, staged_path: Path, release: dict) -> None:
+        app_path = Path(__file__).resolve()
+        backup_path = None
+        marker = app_path.with_name(app_path.name + ".startup-ok")
+        child = None
+        try:
+            if self._recording_active or self._recording_pending or self._playback_active or self._high_angle_running:
+                raise RuntimeError("An automation action became active during download. Stop it and retry.")
+            if self.docked_hwnd is not None and not self.undock_roblox():
+                raise RuntimeError("Roblox could not be safely undocked; update was not installed.")
+            backup_dir = app_path.parent / "backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = backup_dir / f"BTD_Control_Center_{APP_VERSION}_{stamp}.py.bak"
+            shutil.copy2(app_path, backup_path)
+            os.replace(staged_path, app_path)
+            marker.unlink(missing_ok=True)
+            env = os.environ.copy()
+            env["BTD_CC_BOOTSTRAPPED"] = "1"
+            env["BTD_CC_UPDATE_SUCCESS_FILE"] = str(marker)
+            startupinfo = None
+            creationflags = 0
+            if os.name == "nt":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0
+                creationflags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            child = subprocess.Popen(
+                [sys.executable, str(app_path), *sys.argv[1:]],
+                cwd=str(app_path.parent), env=env,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                close_fds=True, creationflags=creationflags, startupinfo=startupinfo,
+            )
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if marker.is_file():
+                    break
+                if child.poll() is not None:
+                    raise RuntimeError("The updated app exited before confirming startup.")
+                time.sleep(0.10)
+            else:
+                raise RuntimeError("The updated app did not confirm startup within 10 seconds.")
+            marker.unlink(missing_ok=True)
+            self.append_log(f"Updated to {release['version']}; startup confirmed; backup saved at {backup_path}.")
+            self.set_status(f"Updated to version {release['version']}. Restarting...", "success")
+            self._input_capture.stop()
+            self._unregister_raw_mouse_input()
+            self.root.after(250, self.root.destroy)
+        except Exception as exc:
+            if child is not None and child.poll() is None:
+                try:
+                    child.terminate()
+                    child.wait(timeout=2.0)
+                except Exception:
+                    try:
+                        child.kill()
+                    except Exception:
+                        pass
+            if backup_path is not None and backup_path.exists():
+                try:
+                    shutil.copy2(backup_path, app_path)
+                except Exception as restore_exc:
+                    exc = RuntimeError(f"{exc}; backup restore also failed: {restore_exc}")
+            try:
+                staged_path.unlink(missing_ok=True)
+                marker.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._update_installing = False
+            self.set_status("Update failed; previous version was retained.", "error")
+            self.append_log(f"Update install failed: {exc}")
+            messagebox.showerror(
+                "Update failed",
+                f"The update did not complete. Your previous version was kept.\n\n{exc}",
+                parent=self.root,
+            )
 
     # ------------------------------------------------------------------
     # Global status and activity log
@@ -530,6 +2212,9 @@ class BTDControlCenter:
             raise ctypes.WinError(error)
 
     def toggle_dock(self) -> None:
+        if self._recording_active or self._recording_pending or self._playback_active or self._high_angle_running:
+            self.set_status("Stop active automation before docking or undocking Roblox.", "warning")
+            return
         if self.docked_hwnd is not None:
             self.undock_roblox()
         else:
@@ -595,8 +2280,7 @@ class BTDControlCenter:
                     win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOZORDER
                     | win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED,
                 ),
-            )
-            actual_owner = int(step("verify window owner", lambda: win32gui.GetWindow(hwnd, getattr(win32con, "GW_OWNER", 4))) or 0)
+            )            actual_owner = int(step("verify window owner", lambda: win32gui.GetWindow(hwnd, getattr(win32con, "GW_OWNER", 4))) or 0)
             if actual_owner != root_hwnd:
                 raise RuntimeError("Windows did not apply the expected Roblox owner relationship.")
             actual_ex = int(step("verify taskbar style", lambda: win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)))
@@ -777,6 +2461,19 @@ class BTDControlCenter:
     # Exit safety
     # ------------------------------------------------------------------
     def close_app(self) -> None:
+        if self._recording_active and self._high_angle_running:
+            self._recording_stop_after_high_angle = True
+            self.record_button.configure(text="STOP AFTER HIGH ANGLE", bg=DANGER, fg="#FFFFFF")
+        elif self._recording_active or self._recording_pending:
+            self.stop_recording()
+        if self._playback_active or self._high_angle_running:
+            self._playback_stop.set()
+            self._high_angle_cancel.set()
+            self.set_status("Stopping active actions. Press Close again after they stop.", "warning")
+            self.append_log("Close requested during automation; safe stop requested before exit.")
+            return
+        self._input_capture.stop()
+        self._unregister_raw_mouse_input()
         hwnd = self.docked_hwnd
         if hwnd is not None and not self.undock_roblox():
             messagebox.showerror(
@@ -804,6 +2501,14 @@ def main() -> None:
     configure_dpi_awareness()
     root = tk.Tk()
     BTDControlCenter(root)
+    success_marker = os.environ.pop("BTD_CC_UPDATE_SUCCESS_FILE", "")
+    if success_marker:
+        def confirm_startup() -> None:
+            try:
+                Path(success_marker).write_text(APP_VERSION, encoding="ascii")
+            except OSError:
+                pass
+        root.after(1200, confirm_startup)
     root.mainloop()
 
 
