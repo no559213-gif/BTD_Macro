@@ -1,0 +1,84 @@
+name: Release BTD Control Center
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - BTD_Control_Center.py
+      - .github/workflows/release-control-center.yml
+
+permissions:
+  contents: write
+
+jobs:
+  release-control-center:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the release source
+        uses: actions/checkout@v4
+
+      - name: Read Control Center version
+        id: app
+        shell: bash
+        run: |
+          VERSION="$(python - <<'PY'
+          import ast
+          from pathlib import Path
+          tree = ast.parse(Path('BTD_Control_Center.py').read_text(encoding='utf-8'))
+          for node in tree.body:
+              if isinstance(node, ast.Assign) and any(
+                  isinstance(target, ast.Name) and target.id == 'APP_VERSION'
+                  for target in node.targets
+              ):
+                  print(ast.literal_eval(node.value))
+                  break
+          else:
+              raise SystemExit('APP_VERSION not found')
+          PY
+          )"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid Control Center version: $VERSION" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Publish versioned Control Center release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG="control-center-v${{ steps.app.outputs.version }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; refusing to overwrite it."
+            exit 1
+          fi
+
+          python - <<'PY'
+          import ast
+          import hashlib
+          from pathlib import Path
+
+          source = Path('BTD_Control_Center.py')
+          digest = hashlib.sha256(source.read_bytes()).hexdigest()
+          Path('BTD_Control_Center.py.sha256').write_text(
+              f"{digest}  BTD_Control_Center.py\\n", encoding='ascii'
+          )
+
+          tree = ast.parse(source.read_text(encoding='utf-8'))
+          notes = 'BTD Control Center update.'
+          for node in tree.body:
+              if isinstance(node, ast.Assign) and any(
+                  isinstance(target, ast.Name) and target.id == 'APP_RELEASE_NOTES'
+                  for target in node.targets
+              ):
+                  notes = ast.literal_eval(node.value)
+                  break
+          Path('RELEASE_NOTES.md').write_text(notes + '\\n', encoding='utf-8')
+          PY
+
+          gh release create "$TAG" \\
+            BTD_Control_Center.py \\
+            BTD_Control_Center.py.sha256 \\
+            --target "$GITHUB_SHA" \\
+            --title "BTD Control Center ${{ steps.app.outputs.version }}" \\
+            --notes-file RELEASE_NOTES.md
