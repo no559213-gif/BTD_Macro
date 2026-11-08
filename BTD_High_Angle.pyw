@@ -23,7 +23,12 @@ HOTKEY_ID = 1
 VK_F9 = 0x78
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
+WM_APP_CHANGE_HOTKEY = 0x8001
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
 MOD_NOREPEAT = 0x4000
+HOTKEY_MODIFIER_MASK = MOD_ALT | MOD_CONTROL | MOD_SHIFT
 
 if os.name != "nt":
     raise SystemExit("BTD High Angle is a Windows-only application.")
@@ -72,6 +77,8 @@ def _configure_winapi() -> None:
     user32.UnregisterHotKey.restype = wintypes.BOOL
     user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
     user32.GetMessageW.restype = ctypes.c_int
+    user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]
+    user32.PeekMessageW.restype = wintypes.BOOL
     user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
     user32.PostThreadMessageW.restype = wintypes.BOOL
     user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
@@ -272,20 +279,29 @@ class HighAngleApp:
         self.root.title(APP_NAME)
         self.root.configure(bg="#11141B")
         self.root.resizable(False, False)
-        self.root.geometry("206x106")
-        self.root.minsize(206, 106)
-        self.root.maxsize(206, 106)
+        self.root.geometry("250x148")
+        self.root.minsize(250, 148)
+        self.root.maxsize(250, 148)
 
         self.settings_path = self._get_settings_path()
-        self.topmost_var = tk.BooleanVar(value=self._load_topmost_setting())
+        self.settings = self._load_settings()
+        self.topmost_var = tk.BooleanVar(value=bool(self.settings.get("always_on_top", False)))
+        self.hotkey_vk = self._setting_int("hotkey_vk", VK_F9, 1, 0xFF)
+        self.hotkey_modifiers = self._setting_int("hotkey_modifiers", 0, 0, HOTKEY_MODIFIER_MASK)
+        self.hotkey_label = str(self.settings.get("hotkey_label") or "F9")
 
         self.cancel = threading.Event()
         self.running = False
         self.state_lock = threading.Lock()
         self.hotkey_events: queue.Queue[str] = queue.Queue()
+        self.hotkey_commands: queue.Queue[tuple[int, int, str]] = queue.Queue()
+        self.hotkey_updates: queue.Queue[tuple[str, str, str, int, int]] = queue.Queue()
         self.hotkey_thread_id = 0
         self.hotkey_ready = threading.Event()
         self.hotkey_error = ""
+        self._capturing_hotkey = False
+        self._capture_binding = None
+        self._ignore_hotkey_until = 0.0
 
         self.button = tk.Button(
             self.root,
@@ -301,7 +317,7 @@ class HighAngleApp:
             cursor="hand2",
             takefocus=True,
         )
-        self.button.pack(fill="both", expand=True, padx=9, pady=(9, 3))
+        self.button.pack(fill="both", expand=True, padx=9, pady=(8, 2))
 
         self.topmost_check = tk.Checkbutton(
             self.root,
@@ -319,16 +335,33 @@ class HighAngleApp:
             cursor="hand2",
             anchor="w",
         )
-        self.topmost_check.pack(fill="x", padx=11, pady=(0, 7))
+        self.topmost_check.pack(fill="x", padx=11, pady=(0, 1))
         self.root.attributes("-topmost", bool(self.topmost_var.get()))
 
+        self.keybind_button = tk.Button(
+            self.root,
+            text=self._keybind_button_text(),
+            command=self._begin_keybind_capture,
+            bg="#202735",
+            fg="#E8ECF4",
+            activebackground="#30394A",
+            activeforeground="#FFFFFF",
+            relief="flat",
+            bd=0,
+            font=("Segoe UI", 9),
+            cursor="hand2",
+            padx=8,
+            pady=4,
+        )
+        self.keybind_button.pack(fill="x", padx=10, pady=(0, 8))
+
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        self.root.after(50, self._poll_hotkey_queue)
+        self.root.after(30, self._poll_hotkey_queue)
         self.hotkey_thread = threading.Thread(
-            target=self._hotkey_loop, name="BTDHighAngleF9", daemon=True
+            target=self._hotkey_loop, name="BTDHighAngleHotkey", daemon=True
         )
         self.hotkey_thread.start()
-        self.root.after(1500, self._check_hotkey_startup)
+        self.root.after(1200, self._check_hotkey_startup)
 
     @staticmethod
     def _get_settings_path() -> Path:
@@ -336,22 +369,37 @@ class HighAngleApp:
         base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
         return base / "BTD_High_Angle" / "settings.json"
 
-    def _load_topmost_setting(self) -> bool:
+    def _load_settings(self) -> dict:
         try:
             data = json.loads(self.settings_path.read_text(encoding="utf-8"))
-            return bool(data.get("always_on_top", False))
+            return data if isinstance(data, dict) else {}
         except (OSError, ValueError, TypeError, AttributeError):
-            return False
+            return {}
+
+    def _setting_int(self, name: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(self.settings.get(name, default))
+            return value if minimum <= value <= maximum else default
+        except (TypeError, ValueError):
+            return default
+
+    def _save_settings(self) -> None:
+        self.settings = {
+            "always_on_top": bool(self.topmost_var.get()),
+            "hotkey_vk": int(self.hotkey_vk),
+            "hotkey_modifiers": int(self.hotkey_modifiers),
+            "hotkey_label": self.hotkey_label,
+        }
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.settings_path.write_text(json.dumps(self.settings, indent=2), encoding="utf-8")
+
+    def _keybind_button_text(self) -> str:
+        return f"Hotkey: {self.hotkey_label}   •   CHANGE"
 
     def _on_topmost_changed(self) -> None:
-        enabled = bool(self.topmost_var.get())
-        self.root.attributes("-topmost", enabled)
+        self.root.attributes("-topmost", bool(self.topmost_var.get()))
         try:
-            self.settings_path.parent.mkdir(parents=True, exist_ok=True)
-            self.settings_path.write_text(
-                json.dumps({"always_on_top": enabled}, indent=2),
-                encoding="utf-8",
-            )
+            self._save_settings()
         except OSError as exc:
             from tkinter import messagebox
             messagebox.showwarning(
@@ -360,30 +408,188 @@ class HighAngleApp:
                 parent=self.root,
             )
 
+    def _begin_keybind_capture(self) -> None:
+        if self.running:
+            return
+        if self._capturing_hotkey:
+            self._end_keybind_capture()
+            self.keybind_button.configure(text=self._keybind_button_text())
+            return
+        self._capturing_hotkey = True
+        self.keybind_button.configure(text="PRESS A KEY  •  ESC CANCEL")
+        self._capture_binding = self.root.bind("<KeyPress>", self._on_keybind_key, add="+")
+        self.root.focus_force()
+        self.keybind_button.focus_set()
+
+    def _end_keybind_capture(self) -> None:
+        self._capturing_hotkey = False
+        if self._capture_binding:
+            try:
+                self.root.unbind("<KeyPress>", self._capture_binding)
+            except tk.TclError:
+                pass
+            self._capture_binding = None
+
+    @staticmethod
+    def _keysym_to_vk(keysym: str) -> int | None:
+        key = str(keysym)
+        lower = key.lower()
+        if len(key) == 1:
+            if "a" <= lower <= "z" or "0" <= key <= "9":
+                return ord(key.upper())
+        if key.startswith("F") and key[1:].isdigit():
+            number = int(key[1:])
+            if 1 <= number <= 24:
+                return 0x70 + number - 1
+        named = {
+            "BackSpace": 0x08, "Tab": 0x09, "Return": 0x0D, "KP_Enter": 0x0D,
+            "Pause": 0x13, "Caps_Lock": 0x14, "Escape": 0x1B, "space": 0x20,
+            "Prior": 0x21, "Next": 0x22, "End": 0x23, "Home": 0x24,
+            "Left": 0x25, "Up": 0x26, "Right": 0x27, "Down": 0x28,
+            "Print": 0x2C, "Insert": 0x2D, "Delete": 0x2E,
+            "Num_Lock": 0x90, "Scroll_Lock": 0x91,
+            "KP_0": 0x60, "KP_1": 0x61, "KP_2": 0x62, "KP_3": 0x63,
+            "KP_4": 0x64, "KP_5": 0x65, "KP_6": 0x66, "KP_7": 0x67,
+            "KP_8": 0x68, "KP_9": 0x69, "KP_Multiply": 0x6A,
+            "KP_Add": 0x6B, "KP_Subtract": 0x6D, "KP_Decimal": 0x6E,
+            "KP_Divide": 0x6F,
+        }
+        return named.get(key)
+
+    @staticmethod
+    def _format_hotkey_label(key: str, modifiers: int) -> str:
+        parts = []
+        if modifiers & MOD_CONTROL:
+            parts.append("Ctrl")
+        if modifiers & MOD_ALT:
+            parts.append("Alt")
+        if modifiers & MOD_SHIFT:
+            parts.append("Shift")
+        parts.append(key)
+        return "+".join(parts)
+
+    def _on_keybind_key(self, event) -> str:
+        keysym = str(getattr(event, "keysym", ""))
+        if keysym in {"Escape", "Esc"}:
+            self._end_keybind_capture()
+            self.keybind_button.configure(text=self._keybind_button_text())
+            return "break"
+
+        vk = self._keysym_to_vk(keysym)
+        if vk is None:
+            return "break"
+
+        state = int(getattr(event, "state", 0))
+        modifiers = 0
+        if state & 0x0004:
+            modifiers |= MOD_CONTROL
+        if state & 0x0008:
+            modifiers |= MOD_ALT
+        if state & 0x0001:
+            modifiers |= MOD_SHIFT
+
+        label = self._format_hotkey_label(
+            keysym.upper() if len(keysym) == 1 else keysym, modifiers
+        )
+        self._end_keybind_capture()
+        self.keybind_button.configure(text="SETTING HOTKEY...")
+        self._ignore_hotkey_until = time.monotonic() + 0.35
+        try:
+            while True:
+                self.hotkey_events.get_nowait()
+        except queue.Empty:
+            pass
+
+        self.hotkey_commands.put((vk, modifiers, label))
+        posted = bool(
+            self.hotkey_thread_id
+            and user32.PostThreadMessageW(
+                self.hotkey_thread_id, WM_APP_CHANGE_HOTKEY, 0, 0
+            )
+        )
+        if not posted:
+            try:
+                self.hotkey_commands.get_nowait()
+            except queue.Empty:
+                pass
+            self.keybind_button.configure(text=self._keybind_button_text())
+            from tkinter import messagebox
+            messagebox.showerror(
+                APP_NAME, "Could not update the global hotkey. Please try again.",
+                parent=self.root,
+            )
+        return "break"
+
     def _hotkey_loop(self) -> None:
         self.hotkey_thread_id = int(kernel32.GetCurrentThreadId())
-        if not user32.RegisterHotKey(None, HOTKEY_ID, MOD_NOREPEAT, VK_F9):
-            self.hotkey_error = (
-                "F9 is already registered by another application. Close that app "
-                "or use the HIGH ANGLE button."
-            )
-            self.hotkey_ready.set()
-            return
-        self.hotkey_ready.set()
         message = wintypes.MSG()
+        user32.PeekMessageW(ctypes.byref(message), None, 0, 0, 0)
+
+        active_vk = int(self.hotkey_vk)
+        active_modifiers = int(self.hotkey_modifiers)
+        active_label = self.hotkey_label
+        registered = bool(user32.RegisterHotKey(
+            None, HOTKEY_ID, active_modifiers | MOD_NOREPEAT, active_vk
+        ))
+        self.hotkey_ready.set()
+        if registered:
+            self.hotkey_updates.put(("ready", active_label, "", active_vk, active_modifiers))
+        else:
+            error_code = ctypes.get_last_error()
+            self.hotkey_updates.put((
+                "failed", active_label,
+                f"Could not register {active_label} globally (Windows error {error_code}).",
+                active_vk, active_modifiers
+            ))
+
         try:
             while True:
                 result = user32.GetMessageW(ctypes.byref(message), None, 0, 0)
                 if result <= 0:
                     break
-                if int(message.message) == WM_HOTKEY and int(message.wParam) == HOTKEY_ID:
-                    self.hotkey_events.put("F9")
+                message_id = int(message.message)
+                if message_id == WM_HOTKEY and int(message.wParam) == HOTKEY_ID:
+                    self.hotkey_events.put("trigger")
+                elif message_id == WM_APP_CHANGE_HOTKEY:
+                    try:
+                        new_vk, new_modifiers, new_label = self.hotkey_commands.get_nowait()
+                    except queue.Empty:
+                        continue
+
+                    old_vk, old_modifiers, old_label = active_vk, active_modifiers, active_label
+                    if registered:
+                        user32.UnregisterHotKey(None, HOTKEY_ID)
+                        registered = False
+
+                    registered = bool(user32.RegisterHotKey(
+                        None, HOTKEY_ID, new_modifiers | MOD_NOREPEAT, new_vk
+                    ))
+                    if registered:
+                        active_vk, active_modifiers, active_label = (
+                            new_vk, new_modifiers, new_label
+                        )
+                        self.hotkey_updates.put((
+                            "changed", active_label, "", active_vk, active_modifiers
+                        ))
+                    else:
+                        error_code = ctypes.get_last_error()
+                        if old_vk and old_label:
+                            registered = bool(user32.RegisterHotKey(
+                                None, HOTKEY_ID, old_modifiers | MOD_NOREPEAT, old_vk
+                            ))
+                        active_vk, active_modifiers, active_label = old_vk, old_modifiers, old_label
+                        self.hotkey_updates.put((
+                            "failed", old_label,
+                            f"That shortcut is unavailable (Windows error {error_code}). "
+                            "Your previous hotkey was kept.",
+                            old_vk, old_modifiers
+                        ))
         finally:
-            user32.UnregisterHotKey(None, HOTKEY_ID)
+            if registered:
+                user32.UnregisterHotKey(None, HOTKEY_ID)
 
     def _check_hotkey_startup(self) -> None:
         if self.hotkey_error:
-            # Keep the window to its single button; explain the hotkey conflict once.
             from tkinter import messagebox
             messagebox.showwarning(APP_NAME, self.hotkey_error, parent=self.root)
 
@@ -391,9 +597,35 @@ class HighAngleApp:
         try:
             while True:
                 self.hotkey_events.get_nowait()
-                self.activate()
+                if not self._capturing_hotkey and time.monotonic() >= self._ignore_hotkey_until:
+                    self.activate()
         except queue.Empty:
             pass
+
+        try:
+            while True:
+                state, label, error, vk, modifiers = self.hotkey_updates.get_nowait()
+                if state in {"ready", "changed"}:
+                    self.hotkey_vk = int(vk)
+                    self.hotkey_modifiers = int(modifiers)
+                    self.hotkey_label = label
+                    self.keybind_button.configure(text=self._keybind_button_text())
+                    try:
+                        self._save_settings()
+                    except OSError as exc:
+                        from tkinter import messagebox
+                        messagebox.showwarning(
+                            APP_NAME, f"Could not save hotkey settings:\\n{exc}",
+                            parent=self.root,
+                        )
+                elif state == "failed":
+                    self.hotkey_error = error
+                    self.keybind_button.configure(text=self._keybind_button_text())
+                    from tkinter import messagebox
+                    messagebox.showwarning(APP_NAME, error, parent=self.root)
+        except queue.Empty:
+            pass
+
         if self.root.winfo_exists():
             self.root.after(30, self._poll_hotkey_queue)
 
